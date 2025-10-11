@@ -109,6 +109,14 @@ async def init_db(pool: asyncpg.Pool):
         );
     """)
     await pool.execute("""
+        ALTER TABLE olx_posts 
+        ADD COLUMN IF NOT EXISTS ai_analysis_json JSONB;
+    """)
+    await pool.execute("""
+        ALTER TABLE olx_posts 
+        ADD COLUMN IF NOT EXISTS is_relevant BOOLEAN;
+    """)
+    await pool.execute("""
         CREATE TABLE IF NOT EXISTS user_base (
             id SERIAL PRIMARY KEY,
             user_id BIGINT,
@@ -1269,6 +1277,6 @@ if __name__ == "__main__":
         asyncio.run(main())
     except Exception as e:
         if "terminated by other getUpdates request" in str(e):
-             logger.critical("❌ **КРИТИЧНА ПОМИЛКА КОНФЛІКТУ:** Виявлено 'TelegramConflictError'. Це означає, що **запущено два або більше екземпляри бота одночасно**. Будь ласка, переконайтеся, що на Вашому хостингу працює лише один екземпляр.")
+             logger.critical("❌ **КРИТИЧНА ПОМИЛКА КОНФЛІКТУ:** Виявлено 'TelegramConflictError'. Це означає, що **запущено два або більше екземплярів бота одночасно**. Будь ласка, переконайтеся, що на Вашому хостингу працює лише один екземпляр.")
         else:
              logger.critical(f"Головна помилка виконання: {e}")
