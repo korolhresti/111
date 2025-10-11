@@ -31,9 +31,11 @@ logger = logging.getLogger(__name__)
 # Змінні оточення
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-# Використовуємо int() для CHANNEL_ID, оскільки Telegram ID є числовими
+# Зчитуємо та намагаємося конвертувати у int. Використовуємо .get() для гнучкості.
 try:
-    CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
+    # Припускаємо, що CHANNEL_ID може бути вказаний як CHANNEL_ID або channel_ID
+    channel_env_var = os.getenv("CHANNEL_ID") or os.getenv("channel_ID")
+    CHANNEL_ID = int(channel_env_var)
 except (TypeError, ValueError):
     CHANNEL_ID = None
     logger.error("CHANNEL_ID не знайдено або має некоректний формат.")
@@ -56,6 +58,9 @@ class BaseForm(StatesGroup):
     waiting_for_photo = State()
     waiting_for_text = State()
 
+# --- ГЛОБАЛЬНЕ ВИЗНАЧЕННЯ ДИСПЕТЧЕРА (FIX: для коректної роботи декораторів) ---
+dp = Dispatcher()
+
 # --- Ініціалізація БД ---
 
 async def init_db(pool):
@@ -73,7 +78,7 @@ async def init_db(pool):
         );
     """)
 
-    # 2. Таблиця для Бази Знань (кнопка 'База')
+    # 2. Таблиця для Бази Знань (еталони)
     await pool.execute("""
         CREATE TABLE IF NOT EXISTS user_base (
             id SERIAL PRIMARY KEY,
@@ -99,7 +104,6 @@ async def init_db(pool):
     logger.info("Ініціалізація БД завершена.")
 
 # --- Модуль Gemini AI (ЕКОНОМІЧНА Заглушка) ---
-# Імітація роботи Gemini 2.5 Flash
 
 class GeminiMock:
     """Заглушка для Gemini AI, імітує швидкий та економічний аналіз (Gemini 2.5 Flash)."""
@@ -125,8 +129,8 @@ class GeminiMock:
         """
         
         # Обчислення ймовірності покращення автентичності на основі Бази Знань
-        base_match_probability = len(user_base_context) * 0.05 # Кожен еталон додає 5% до шансу бути оригіналом
-        is_original = random.random() < (0.7 + base_match_probability) # Базова ймовірність 70% + контекст
+        base_match_probability = len(user_base_context) * 0.05 
+        is_original = random.random() < (0.7 + base_match_probability) 
         
         # Етап I: Ідентифікація
         mark_detected = random.choice(["Проба 585", "Клеймо 'Л' (Louis)", "Не знайдено"])
@@ -137,11 +141,9 @@ class GeminiMock:
         estimated_value_low = random.randint(7000, 10000)
         estimated_value_high = estimated_value_low + 3000
         
-        # Імітуємо ціну, яку "знайшов" Scraper/Парсер
         olx_price_mock = random.randint(4000, 12000) 
         
-        # Оцінка Вигідності (ЕКОНОМІЧНИЙ ЛОГІЧНИЙ ПАРАМЕТР)
-        # Вигідна ціна, якщо на 20% нижче оціночної нижньої межі
+        # Оцінка Вигідності
         if olx_price_mock < estimated_value_low * 0.8: 
             deal_assessment = "🔥 Вигідна Ціна"
         elif olx_price_mock > estimated_value_high * 1.1:
@@ -151,7 +153,6 @@ class GeminiMock:
 
         
         result = {
-            # Публікуємо, якщо: ймовірно оригінал АБО вигідна ціна
             "is_relevant": is_original or deal_assessment == "🔥 Вигідна Ціна", 
             "authenticity": "Ймовірно Оригінал" if is_original else "Можлива Підробка",
             "mark_detected": mark_detected,
@@ -169,15 +170,12 @@ async def fetch_olx_data(session, pool):
     """Асинхронно збирає нові оголошення з OLX з фільтрами."""
     new_posts = []
     
-    # Використовуємо лише один пошуковий запит для прикладу
     search_term = OLX_SEARCH_QUERIES[0]
-    # URL з фільтрами: золото, ціна від 2000
     olx_search_url = f"https://www.olx.ua/d/uk/list/q-{search_term}/?currency=UAH&search%5Bfilter_float_price%3Afrom%5D={OLX_PRICE_FILTER}"
     
     logger.info(f"Запуск сканування OLX: {olx_search_url}")
     
     try:
-        # Асинхронний запит з таймаутом
         async with session.get(olx_search_url, timeout=20) as response:
             response.raise_for_status()
             html = await response.text()
@@ -189,10 +187,8 @@ async def fetch_olx_data(session, pool):
         return new_posts
 
     soup = BeautifulSoup(html, 'lxml')
-    # Шукаємо оголошення
     items = soup.find_all('div', {'data-cy': re.compile(r'l-card')})
 
-    # Отримання вже перевірених ID з БД
     async with pool.acquire() as conn:
         existing_ids = await conn.fetchval("SELECT array_agg(olx_id) FROM olx_posts") or []
 
@@ -203,7 +199,6 @@ async def fetch_olx_data(session, pool):
             
         full_url = urljoin(olx_search_url, olx_url_tag.get('href'))
         
-        # Надійний пошук OLX ID
         match = re.search(r'-ID(\d+)\.html', full_url)
         olx_id = match.group(1) if match else None
         
@@ -213,7 +208,6 @@ async def fetch_olx_data(session, pool):
         title = item.find('h6').text.strip() if item.find('h6') else 'N/A'
         price_text = item.find('p', {'data-testid': 'price'}).text.strip() if item.find('p', {'data-testid': 'price'}) else '0 UAH'
         price_match = re.search(r'([\d\s]+)', price_text)
-        # Очищення ціни від пробілів
         price_uah = int("".join(price_match.group(1).split())) if price_match else 0
         
         img_tag = item.find('img')
@@ -247,11 +241,9 @@ async def send_olx_post(bot, item, ai_result):
     
     refs_text = ""
     for i, ref in enumerate(ai_result.get('references', [])):
-        # Форматування ціни з роздільниками тисяч
         price_formatted = f"{ref['price']:,}".replace(',', ' ')
         refs_text += f"*{i+1}.* {price_formatted} грн. [Посилання]({ref['url']})\n"
     
-    # Форматування ціни оголошення з роздільниками тисяч
     olx_price_formatted = f"{item['price']:,}".replace(',', ' ')
     
     message_text = (
@@ -436,7 +428,6 @@ async def olx_monitoring_worker(bot, pool, gemini_mock, dp, interval=600):
                 dp['gemini_feedback'].clear() # Очистка пулу
 
             # 2. СКАНУВАННЯ OLX
-            # Створюємо сесію всередині циклу, щоб гарантувати її свіжість
             async with aiohttp.ClientSession() as session:
                 new_posts = await fetch_olx_data(session, pool)
                 
@@ -462,7 +453,7 @@ async def olx_monitoring_worker(bot, pool, gemini_mock, dp, interval=600):
                                     post['olx_id'], post['title'], post['price'], datetime.now(KYIV_TZ)
                                 )
         except Exception as e:
-            logger.error(f"Глобальна помибка у воркері моніторингу: {e}")
+            logger.error(f"Глобальна помилка у воркері моніторингу: {e}")
             
         await asyncio.sleep(interval) 
 
@@ -479,30 +470,14 @@ async def main():
     pool = await asyncpg.create_pool(DATABASE_URL)
     await init_db(pool)
     
+    # Ініціалізація об'єкта Bot
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
-    global dp 
-    dp = Dispatcher()
     
-    # Передача залежностей
+    # Передача залежностей у Dispatcher (dp вже визначений глобально)
     dp['pool'] = pool
     dp['gemini_mock'] = GeminiMock(pool)
     dp['bot'] = bot
     dp['gemini_feedback'] = [] # Сховище для ID, які отримали 👎 (Навчальний пул)
-
-    # Реєстрація всіх хендлерів
-    dp.message.register(command_start_handler, Command("start"))
-    dp.message.register(command_base_list_handler, Command("base_list"))
-    
-    # FSM для /base
-    dp.message.register(command_base_handler, Command("base"))
-    dp.message.register(cancel_handler, Command("cancel"))
-    dp.message.register(handle_base_photo, BaseForm.waiting_for_photo, F.photo)
-    dp.message.register(handle_base_photo_invalid, BaseForm.waiting_for_photo)
-    dp.message.register(handle_base_text, BaseForm.waiting_for_text, F.text)
-    dp.message.register(handle_base_text_invalid, BaseForm.waiting_for_text)
-    
-    # Callback для зворотного зв'язку
-    dp.callback_query.register(feedback_callback_handler, F.data.startswith("fb_"), pool=pool, dp=dp)
 
     # Запуск фонового воркера
     asyncio.create_task(olx_monitoring_worker(bot, pool, dp['gemini_mock'], dp))
@@ -510,6 +485,7 @@ async def main():
     logger.info("Бот запущено. Починаю опитування...")
     
     try:
+        # dp.start_polling() працює з глобально визначеним dp
         await dp.start_polling(bot)
     except Exception as e:
         logger.critical(f"Критична помилка виконання: {e}")
