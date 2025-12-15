@@ -31,6 +31,23 @@ except (TypeError, ValueError):
     logging.error("ADMIN_CHAT_ID не знайдено або це не число!")
     ADMIN_ID = 0
 
+# --- ФУНКЦІЯ ПРИ ЗАПУСКУ ---
+async def on_startup(bot: Bot):
+    """Ця функція спрацьовує один раз при старті бота."""
+    try:
+        # ДОДАЙТЕ ЦЕЙ РЯДОК: Скидає всі активні Polling/Webhook сесії
+        await bot.delete_webhook(drop_pending_updates=True) 
+        
+        # Конвертуємо ID каналу в int, якщо він в форматі "-100..."
+        chat_id = int(CHANNEL_ID) if str(CHANNEL_ID).startswith("-100") else CHANNEL_ID
+        await bot.send_message(chat_id, "🤖 **NEON BOT ONLINE**\\nПривіт! Я готовий до роботи.")
+        logging.info("Startup message sent to channel and admin.")
+    except Exception as e:
+        # ... (ваш існуючий код обробки помилок)
+        logging.error(f"Не вдалося відправити привіт: {e}") 
+
+
+
 # --- 2. НАЛАШТУВАННЯ GEMINI ТА БОТА ---
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
