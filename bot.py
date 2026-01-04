@@ -1,298 +1,286 @@
 import asyncio
 import logging
-import io
 import os
-import requests
-import hashlib 
-import asyncpg # Додано для роботи з базою даних Neon
+import sys
+import json
+import re
+from datetime import datetime, time
+import pytz
+
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from bs4 import BeautifulSoup
+
 import google.generativeai as genai
 from PIL import Image
+import asyncpg
+import aiohttp
 from dotenv import load_dotenv
 
-# --- 1. ЗАВАНТАЖЕННЯ ЗМІННИХ СЕРЕДОВИЩА ---
+# --- 1. КОНФІГУРАЦІЯ ТА БЕЗПЕКА ---
 load_dotenv()
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# Отримуємо змінні (Render автоматично підставить їх з Environment Variables)
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")
+ADMIN_ID = os.getenv("ADMIN_CHAT_ID")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
-DATABASE_URL = os.getenv("DATABASE_URL") # Додано змінну для БД
 
-try:
-    ADMIN_ID = int(os.getenv("ADMIN_CHAT_ID"))
-except (TypeError, ValueError):
-    logging.error("ADMIN_CHAT_ID не знайдено або це не число!")
-    ADMIN_ID = 0
+# Часовий пояс для режиму "Тиша"
+KYIV_TZ = pytz.timezone('Europe/Kyiv')
 
-# --- 2. НАЛАШТУВАННЯ GEMINI ---
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-1.5-flash')
-else:
-    logging.error("GEMINI_API_KEY не знайдено в .env")
+# Налаштування логування (важливо для Render logs)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("WatchExpertBot")
 
-# --- 3. НАЛАШТУВАННЯ БОТА ТА БД ---
-logging.basicConfig(level=logging.INFO)
-bot = Bot(token=TELEGRAM_TOKEN)
+# Ініціалізація Gemini (Vision Model)
+genai.configure(api_key=GEMINI_API_KEY)
+# Використовуємо 'flash' для швидкості або 'pro' для максимальної деталізації (як в ТЗ)
+model = genai.GenerativeModel('gemini-1.5-flash') 
+
+# Ініціалізація бота
+bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-# Глобальна змінна для пулу з'єднань БД
-db_pool = None
+# --- 2. БАЗА ДАНИХ (ВІДПОВІДАЄ WEB-DASHBOARD) ---
+async def create_db_pool():
+    return await asyncpg.create_pool(DATABASE_URL)
 
-# ----------------------------------------------------
-# --- ФУНКЦІЇ БАЗИ ДАНИХ (DB) ---
-# ----------------------------------------------------
+async def init_db(pool):
+    async with pool.acquire() as conn:
+        # Створюємо розширену таблицю для зберігання всіх параметрів ТЗ 4.1
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS watches (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                username TEXT,
+                image_file_id TEXT,
+                
+                -- Deep Vision Data
+                brand TEXT,
+                mechanism_type TEXT, -- Quartz/Automatic
+                glass_type TEXT,     -- Sapphire/Mineral
+                case_material TEXT,
+                symmetry_score INT,  -- % симетрії
+                is_frankenstein BOOLEAN,
+                
+                -- Financials
+                liquidity_score INT, -- 1-10
+                price_estimate_usd NUMERIC,
+                currency_rate NUMERIC,
+                
+                -- Meta
+                full_ai_report TEXT,
+                tags TEXT[],
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        logger.info("Database schema initialized.")
 
-async def create_tables():
-    """Створює таблиці, якщо вони не існують."""
-    global db_pool
-    if not db_pool:
-        return False
-    
-    # Використовуйте вашу фактичну SQL-схему. Це приклад.
-    SQL_SCHEMA = """
-    CREATE TABLE IF NOT EXISTS processed_photos (
-        photo_hash VARCHAR(64) PRIMARY KEY,
-        timestamp TIMESTAMPTZ DEFAULT NOW(),
-        search_query TEXT
-    );
+# --- 3. ДОПОМІЖНІ ФУНКЦІЇ (UX & MARKET DATA) ---
+
+async def get_usd_rate():
+    """Отримує актуальний курс USD/UAH (ПриватБанк API) для розрахунків."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get('https://api.privatbank.ua/p24api/pubinfo?exchange&coursid=5') as resp:
+                data = await resp.json(content_type=None)
+                for item in data:
+                    if item['ccy'] == 'USD':
+                        return float(item['sale'])
+    except Exception as e:
+        logger.error(f"Currency API failed: {e}. Using fallback rate.")
+        return 42.0 # Fallback
+
+def is_quiet_mode():
+    """Перевіряє, чи зараз ніч (23:00 - 08:00) за Києвом."""
+    now = datetime.now(KYIV_TZ).time()
+    # Якщо час більше 23:00 АБО менше 08:00
+    return now >= time(23, 0) or now < time(8, 0)
+
+async def send_admin_alert(text: str):
+    """Система самодіагностики: відправка критичних помилок адміну."""
+    if ADMIN_ID:
+        try:
+            await bot.send_message(chat_id=ADMIN_ID, text=f"🚨 <b>SYSTEM ALERT:</b>\n{text}")
+        except Exception:
+            pass
+
+# --- 4. ЯДРО AI (DEEP VISION PROMPT) ---
+def build_expert_prompt(usd_rate):
     """
-    try:
-        async with db_pool.acquire() as conn:
-            await conn.execute(SQL_SCHEMA)
-        return True
-    except Exception as e:
-        logging.error(f"Помилка створення таблиць: {e}")
-        return False
+    Промпт, що реалізує ТЗ 4.1. Змушує модель працювати як JSON-API.
+    """
+    return f"""
+    You are "Watch-Expert AI Pro" (v4.1). Perform a deep visual analysis of this watch.
+    Current USD/UAH Rate: {usd_rate}.
 
-async def init_db_pool():
-    """Ініціалізує пул з'єднань з базою даних."""
-    global db_pool
-    if not DATABASE_URL:
-        logging.error("DATABASE_URL не знайдено. База даних буде недоступна.")
-        return False
+    ANALYZE THESE 10 POINTS (Deep Vision):
+    1. Mechanism (Quartz vs Automatic via visual cues).
+    2. Symmetry (Dial alignment, logo position).
+    3. Glass (Sapphire vs Mineral reflections).
+    4. Dial Texture (Guilloche vs Print).
+    5. Lume quality.
+    6. Case Material (Steel, Titanium, Plated).
+    7. Clasp Type.
+    8. Font Analysis (Consistency).
+    9. Liquidity Score (1-10).
+    10. Brand Trends.
 
-    try:
-        db_pool = await asyncpg.create_pool(
-            DATABASE_URL, 
-            min_size=1, 
-            max_size=10,
-            timeout=30 # Додано таймаут
-        )
-        if await create_tables():
-            logging.info("Neon DB pool and tables initialized successfully.")
-            return True
-        return False
-    except Exception as e:
-        logging.error(f"Помилка підключення до Neon DB: {e}")
-        return False
+    OUTPUT FORMAT:
+    Return a strictly valid JSON object ONLY. No markdown, no "json" tags, just the raw object.
+    Structure:
+    {{
+        "brand": "String (e.g. Seiko)",
+        "mechanism_type": "String (Quartz/Automatic)",
+        "glass_type": "String",
+        "case_material": "String",
+        "symmetry_score": Integer (0-100),
+        "is_frankenstein": Boolean,
+        "liquidity_score": Integer (1-10),
+        "price_usd_min": Integer,
+        "price_usd_max": Integer,
+        "tags": ["#Tag1", "#Tag2"],
+        "human_readable_report_ua": "A detailed analysis in Ukrainian with emojis using the structure from the requirements."
+    }}
+    """
 
-async def close_db_pool():
-    """Закриває пул з'єднань при зупинці бота."""
-    global db_pool
-    if db_pool:
-        logging.info("Closing Neon DB pool...")
-        await db_pool.close()
-        logging.info("Neon DB pool closed.")
+# --- 5. ОБРОБНИКИ ПОДІЙ (HANDLERS) ---
 
-
-# ----------------------------------------------------
-# --- ФУНКЦІЇ БОТА ---
-# ----------------------------------------------------
-
-# --- ФУНКЦІЯ: OLX PARSER ---
-def search_olx(query):
-    # ... (Ваша функція search_olx залишається без змін) ...
-    """Шукає товар на OLX за запитом і повертає список словників."""
-    search_query = query.replace(" ", "-")
-    url = f"https://www.olx.ua/uk/list/q-{search_query}/"
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    }
-
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code != 200:
-            return []
-
-        soup = BeautifulSoup(response.text, 'html.parser')
-        listings = []
-        
-        # Пошук карток (може потребувати оновлення селекторів, якщо OLX змінить дизайн)
-        cards = soup.find_all('div', {'data-cy': 'l-card'})
-
-        for card in cards[:5]:
-            try:
-                title_tag = card.find('h6')
-                price_tag = card.find('p', {'data-testid': 'ad-price'})
-                link_tag = card.find('a', href=True)
-
-                if title_tag and link_tag:
-                    title = title_tag.text.strip()
-                    price = price_tag.text.strip() if price_tag else "Ціна не вказана"
-                    link = link_tag['href']
-                    if not link.startswith("http"):
-                        link = f"https://www.olx.ua{link}"
-
-                    listings.append({"title": title, "price": price, "link": link})
-            except Exception:
-                continue
-        return listings
-    except Exception as e:
-        logging.error(f"Помилка парсингу OLX: {e}")
-        return []
-
-# --- ФУНКЦІЯ: GEMINI VISION ---
-async def identify_image(photo_bytes):
-    # ... (Ваша функція identify_image залишається без змін) ...
-    """Розпізнає товар на фото."""
-    try:
-        image = Image.open(io.BytesIO(photo_bytes))
-        prompt = (
-            "Ти помічник для пошуку товарів. Подивись на це фото. "
-            "Що саме тут зображено? Напиши ТІЛЬКИ назву предмета для пошукового запиту "
-            "на сайті оголошень (OLX). Мова: Українська. "
-            "Приклад відповіді: 'Відеокарта RTX 3060', 'Червоний диван', 'Iphone 13'. "
-            "Нічого зайвого, тільки 2-4 ключових слова."
-        )
-        response = await asyncio.to_thread(model.generate_content, [prompt, image])
-        return response.text.strip()
-    except Exception as e:
-        logging.error(f"Gemini Error: {e}")
-        return None
-
-# --- ОБРОБНИК ФОТО ---
-@dp.message(F.photo)
-async def handle_photo(message: types.Message):
-    # ... (Ваша функція handle_photo залишається без змін) ...
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔ Ви не адміністратор.")
-        return
-
-    status_msg = await message.answer("👾 **NEON BASE:** Сканую об'єкт...", parse_mode=ParseMode.MARKDOWN)
-
-    try:
-        # Завантаження фото в пам'ять
-        photo = message.photo[-1]
-        file_info = await bot.get_file(photo.file_id)
-        photo_bytes = io.BytesIO()
-        await bot.download_file(file_info.file_path, destination=photo_bytes)
-        photo_data = photo_bytes.getvalue()
-        
-        # Перевірка на дублікат (якщо DB підключена)
-        # photo_hash = hashlib.sha256(photo_data).hexdigest()
-        # if db_pool:
-        #    async with db_pool.acquire() as conn:
-        #        exists = await conn.fetchval("SELECT photo_hash FROM processed_photos WHERE photo_hash = $1", photo_hash)
-        #        if exists:
-        #            await status_msg.edit_text("⚠️ **Помилка:** Це фото вже було оброблено.")
-        #            return
-
-
-        # Розпізнавання через AI
-        search_query = await identify_image(photo_data)
-        if not search_query:
-            await status_msg.edit_text("❌ Gemini не зміг розпізнати об'єкт.")
-            return
-
-        await status_msg.edit_text(f"👁 **Розпізнано:** `{search_query}`\n📡 Підключаюсь до OLX...")
-
-        # Пошук на OLX
-        items = await asyncio.to_thread(search_olx, search_query)
-        if not items:
-            await status_msg.edit_text(f"⚠️ На OLX нічого не знайдено за запитом: **{search_query}**")
-            return
-
-        # Формування посту
-        caption = f"💠 **RENDER FINDER**\n\n"
-        caption += f"🔎 Лот: **{search_query}**\n"
-        caption += f"➖➖➖➖➖➖➖➖➖➖\n"
-        for i, item in enumerate(items, 1):
-            caption += f"{i}. [{item['title']}]({item['link']})\n🏷 **{item['price']}**\n\n"
-        caption += f"➖➖➖➖➖➖➖➖➖➖\n#render #neon #finder"
-
-        # Публікація в канал
-        await bot.send_photo(chat_id=CHANNEL_ID, photo=photo.file_id, caption=caption, parse_mode=ParseMode.MARKDOWN)
-        await status_msg.edit_text(f"✅ **Опубліковано!**")
-
-    except Exception as e:
-        logging.error(f"Critical Error: {e}")
-        await status_msg.edit_text("❌ Сталася критична помилка. Перевірте логи.")
-
-
-# ----------------------------------------------------
-# --- ФУНКЦІЇ ЗАПУСКУ/ЗУПИНКИ ---
-# ----------------------------------------------------
-
-# --- СТАРТОВА КОМАНДА ---
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    if message.from_user.id == ADMIN_ID:
-        await message.answer("Привіт, Адмін! Кидай фото, я готовий працювати.")
-    else:
-        await message.answer("Я приватний бот.")
-
-
-# --- ФУНКЦІЯ ПРИ ЗАПУСКУ ---
-async def on_startup(bot: Bot):
-    """Ця функція спрацьовує один раз при старті бота, ініціалізує БД та надсилає вітання."""
-    
-    # --- КРОК 1: ФІКС КОНФЛІКТУ ---
-    try:
-        # ЦЕ ПОВИННО БУТИ ПЕРШИМ: Скидаємо всі активні Polling/Webhook сесії для уникнення TelegramConflictError
-        await bot.delete_webhook(drop_pending_updates=True) 
-        logging.info("Old Telegram sessions cleared. Conflict error fixed.")
-    except Exception as e:
-        logging.error(f"Не вдалося скинути вебхуки: {e}")
-        # Продовжуємо роботу, навіть якщо скидання не вдалося
-        
-    # --- КРОК 2: ІНІЦІАЛІЗАЦІЯ БД ---
-    db_connected = await init_db_pool()
-    db_status_text = "✅ Neon DB Online" if db_connected else "❌ Neon DB Offline (Кешування недоступне)"
-    
-    # --- КРОК 3: ВІТАННЯ ---
-    channel_startup_message = (
-        "🤖 **NEON RENDER FINDER ONLINE**\n"
-        f"Системи завантажені: Gemini Vision, OLX Parser.\n"
-        f"Статус БД: **{db_status_text}**\n\n"
-        "Очікую нові лоти від Адміністратора. ✨"
+    await message.answer(
+        f"👋 Вітаю, {message.from_user.full_name}!\n"
+        "Я — <b>Watch-Expert AI Pro v4.1</b>.\n\n"
+        "📸 <b>Надішліть фото годинника</b> для:\n"
+        "• Перевірки на 'Франкенштейна'\n"
+        "• Визначення механізму та скла\n"
+        "• Оцінки ринкової вартості (USD/UAH)"
     )
 
+@dp.message(F.photo)
+async def handle_photo(message: types.Message, db_pool):
+    user_id = message.from_user.id
+    
+    # Режим тиші (UX)
+    if is_quiet_mode():
+        await message.answer("🌙 <i>Прийнято. Зараз режим 'Тиша', аналіз може зайняти трохи більше часу.</i>")
+
+    status_msg = await message.answer("⏳ <b>AI Vision+ сканує зображення...</b>\n<i>(Перевірка симетрії, калібру, шрифтів)</i>")
+    
+    temp_path = f"temp_{message.photo[-1].file_id}.jpg"
+    
     try:
-        chat_id = int(CHANNEL_ID) if str(CHANNEL_ID).startswith("-100") else CHANNEL_ID
+        # 1. Завантаження фото
+        photo = message.photo[-1]
+        file_info = await bot.get_file(photo.file_id)
+        await bot.download_file(file_info.file_path, temp_path)
         
-        await bot.send_message(
-            chat_id=chat_id, 
-            text=channel_startup_message,
-            parse_mode=ParseMode.MARKDOWN
-        )
-        await bot.send_message(
-            chat_id=ADMIN_ID,
-            text=f"✅ **Система запущена.** {db_status_text}",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        logging.info("Startup message sent to channel and admin.")
+        # 2. Отримання даних
+        usd_rate = await get_usd_rate()
+        img = Image.open(temp_path)
+        
+        # 3. AI Аналіз
+        prompt = build_expert_prompt(usd_rate)
+        response = await asyncio.to_thread(model.generate_content, [prompt, img])
+        
+        # 4. Обробка відповіді (JSON Cleaning)
+        raw_text = response.text.replace('```json', '').replace('```', '').strip()
+        
+        try:
+            data = json.loads(raw_text)
+        except json.JSONDecodeError:
+            # Fallback якщо модель повернула текст, а не JSON
+            logger.error("AI returned invalid JSON. Using raw text.")
+            data = {
+                "human_readable_report_ua": raw_text,
+                "liquidity_score": 0,
+                "price_usd_min": 0,
+                "tags": []
+            }
+
+        report_text = data.get("human_readable_report_ua", "Звіт не згенеровано.")
+        
+        # 5. Збереження в PostgreSQL
+        async with db_pool.acquire() as conn:
+            await conn.execute('''
+                INSERT INTO watches (
+                    user_id, username, image_file_id, 
+                    brand, mechanism_type, glass_type, case_material,
+                    symmetry_score, is_frankenstein, liquidity_score,
+                    price_estimate_usd, currency_rate, full_ai_report, tags
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            ''', 
+            user_id, message.from_user.username, photo.file_id,
+            data.get("brand"), data.get("mechanism_type"), data.get("glass_type"), data.get("case_material"),
+            data.get("symmetry_score", 100), data.get("is_frankenstein", False), data.get("liquidity_score", 5),
+            data.get("price_usd_min", 0), usd_rate, report_text, data.get("tags", []))
+
+        # 6. Відповідь користувачу
+        # Додаємо ціну в гривнях, якщо є ціна в доларах
+        price_usd = data.get("price_usd_min", 0)
+        if price_usd:
+            price_uah = int(price_usd * usd_rate)
+            report_text += f"\n\n💱 <b>Курс:</b> {price_uah:,} UAH (по {usd_rate})"
+
+        # Кнопки дій
+        kb = InlineKeyboardBuilder()
+        kb.button(text="📢 В канал", callback_data=f"pub_wait")
+        kb.button(text="🔍 Chrono24", url="https://www.chrono24.com/")
+        
+        await status_msg.edit_text(report_text, reply_markup=kb.as_markup())
+
     except Exception as e:
-        logging.error(f"Не вдалося відправити повідомлення про запуск: {e}")
+        logger.error(f"Critical Error: {e}")
+        await status_msg.edit_text("❌ Виникла помилка при обробці. Інформацію передано розробнику.")
+        await send_admin_alert(f"User {user_id} error: {e}")
+        
+    finally:
+        # Прибирання сміття
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
+@dp.callback_query(F.data == "pub_wait")
+async def cb_publish(callback: types.CallbackQuery):
+    await callback.answer("Функція 'Публікація' додасть лот в чергу модерації.", show_alert=True)
 
-# --- MAIN ---
+# --- 6. ЗАПУСК (MAIN) ---
+
 async def main():
-    # Реєструємо функцію запуску (виконується перед start_polling)
-    dp.startup.register(on_startup)
+    # Health-check при старті
+    logger.info("Starting Watch-Expert AI Pro v4.1...")
     
-    # Реєструємо функцію зупинки (виконується при зупинці/перезапуску)
-    dp.shutdown.register(close_db_pool) # Для коректного закриття DB
+    # Підключення до БД
+    try:
+        db_pool = await create_db_pool()
+        await init_db(db_pool)
+        logger.info("✅ Database connected.")
+    except Exception as e:
+        logger.critical(f"❌ DB Connection failed: {e}")
+        sys.exit(1)
+
+    # Ін'єкція залежностей
+    dp["db_pool"] = db_pool
+
+    # Видалення вебхуків (обов'язково для polling)
+    await bot.delete_webhook(drop_pending_updates=True)
     
-    # Починаємо слухати оновлення
-    await dp.start_polling(bot)
+    # Сповіщення адміна про деплой
+    await send_admin_alert("🚀 <b>DEPLOY SUCCESSFUL:</b> Бот перезавантажено на сервері.")
+    
+    # Старт
+    await dp.start_polling(bot, db_pool=db_pool)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped.")

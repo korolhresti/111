@@ -6,3 +6,4 @@ requests
 google-generativeai
 pillow
 python-dotenv
+pytz
