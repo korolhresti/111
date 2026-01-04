@@ -3,7 +3,7 @@ asyncpg
 aiohttp==3.9.5
 beautifulsoup4==4.12.3
 requests
-google-generativeai
+google-genai
 pillow
 python-dotenv
 pytz
