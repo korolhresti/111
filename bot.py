@@ -203,7 +203,7 @@ class Evaluator:
             elif d.get("type") == "stretched_bracelet": base += Decimal("0.07")
         return base
 
-        def kit_bonus(self, kit: dict) -> Decimal:
+    def kit_bonus(self, kit: dict) -> Decimal:
         return Decimal("0.25") if any(kit.values()) else Decimal("0.00")
 
     def trend_adjustment(self, flags: dict) -> Decimal:
@@ -215,6 +215,7 @@ class Evaluator:
 
     def fair_price(self, base: Decimal, penalties: Decimal, bonus: Decimal, trend_adj: Decimal) -> Decimal:
         return base * (Decimal("1.00") - penalties + bonus + trend_adj)
+
 class Scheduler:
     def __init__(self, bot: Bot, db: Database, scraper: Scraper):
         self.bot = bot
