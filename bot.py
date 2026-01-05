@@ -1,5 +1,5 @@
 # bot.py
-import os, io, re, json, asyncio, logging, random
+import os, io, re, json, asyncio, logging
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from decimal import Decimal
@@ -12,6 +12,8 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, BotCommand
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram import BaseMiddleware
+from aiohttp import web
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 # google-genai SDK
 try:
@@ -52,9 +54,6 @@ def load_settings() -> Settings:
 settings = load_settings()
 TZ = pytz.timezone(settings.TZ)
 
-# -----------------------------
-# Логування
-# -----------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 # -----------------------------
@@ -164,6 +163,35 @@ class VisionExpert:
         }
 
 # -----------------------------
+# Ринкові дані, тренди, автотеги
+# -----------------------------
+STOP_WORDS = ["копія", "репліка", "кварц не працює"]
+WHITELIST_BRANDS = ["Seiko", "Rolex", "Omega", "Casio"]
+
+def text_flags(text: str) -> dict:
+    lower = text.lower()
+    return {
+        "stop_words": [w for w in STOP_WORDS if w in lower],
+        "green_dial_trend": bool(re.search(r"\bgreen\b|\bзелений\b", lower)),
+        "season": get_season()
+    }
+
+def get_season() -> str | None:
+    month = datetime.now(TZ).month
+    if month in (6, 7, 8): return "summer"
+    if month in (12, 1, 2): return "winter"
+    return None
+
+def auto_tags(title: str) -> list[str]:
+    tags = []
+    for brand in WHITELIST_BRANDS:
+        if brand.lower() in title.lower():
+            tags.append(f"#{brand}")
+    if "diver" in title.lower(): tags.append("#Diver")
+    if "deal" in title.lower(): tags.append("#SuperDeal")
+    return tags
+
+# -----------------------------
 # Evaluator (справедлива ціна)
 # -----------------------------
 class Evaluator:
@@ -172,40 +200,21 @@ class Evaluator:
         for d in defects:
             if d.get("type") == "scratch": base += Decimal("0.03")
             elif d.get("type") == "chip": base += Decimal("0.05")
+            elif d.get("type") == "stretched_bracelet": base += Decimal("0.07")
         return base
 
-    def kit_bonus(self, kit: dict) -> Decimal:
+        def kit_bonus(self, kit: dict) -> Decimal:
         return Decimal("0.25") if any(kit.values()) else Decimal("0.00")
 
-    def fair_price(self, base: Decimal, penalties: Decimal, bonus: Decimal) -> Decimal:
-        return base * (Decimal("1.00") - penalties + bonus)
+    def trend_adjustment(self, flags: dict) -> Decimal:
+        adj = Decimal("0.00")
+        if flags.get("green_dial_trend"): adj += Decimal("0.05")
+        if flags.get("season") == "summer": adj += Decimal("0.03")
+        if flags.get("season") == "winter": adj += Decimal("0.02")
+        return adj
 
-# -----------------------------
-# Scraper OLX
-# -----------------------------
-class Scraper:
-    def __init__(self, proxies: list[dict]):
-        self.proxies = proxies
-
-    async def fetch_html(self, url: str) -> str:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                return await resp.text()
-
-    async def parse_olx(self, url: str) -> list[dict]:
-        html = await self.fetch_html(url)
-        soup = BeautifulSoup(html, "html.parser")
-        listings = []
-        for card in soup.select("div[data-cy='l-card']"):
-            title = card.select_one("h6").get_text(strip=True)
-            price_text = card.select_one("p[data-testid='ad-price']").get_text(strip=True)
-            link = card.select_one("a")["href"]
-            listings.append({"title": title, "price_text": price_text, "url": link})
-        return listings
-
-# -----------------------------
-# Scheduler (адаптивне сканування, health-check)
-# -----------------------------
+    def fair_price(self, base: Decimal, penalties: Decimal, bonus: Decimal, trend_adj: Decimal) -> Decimal:
+        return base * (Decimal("1.00") - penalties + bonus + trend_adj)
 class Scheduler:
     def __init__(self, bot: Bot, db: Database, scraper: Scraper):
         self.bot = bot
@@ -217,8 +226,7 @@ class Scheduler:
         asyncio.create_task(self.run())
 
     async def health_check(self):
-        # Простий health-check: можна розширити
-        logging.info("Health-check OK")
+        logging.info("✅ Health-check OK")
         await self.bot.send_message(settings.ADMIN_CHAT_ID, "✅ Health-check: система працює стабільно")
 
     async def run(self):
@@ -240,14 +248,12 @@ class Scheduler:
                 for l in listings:
                     if "error" in l: 
                         continue
-                    price = Decimal("0.00")
-                    currency = "UAH"
                     lot = {
                         "source": "olx",
                         "external_id": l["url"],
                         "title": l["title"],
-                        "price": price,
-                        "currency": currency,
+                        "price": Decimal("0.00"),
+                        "currency": "UAH",
                         "location": None,
                         "url": l["url"],
                         "images": [],
@@ -255,7 +261,7 @@ class Scheduler:
                         "kit_score": Decimal("0.00"),
                         "defects": [],
                         "vision_flags": {},
-                        "fair_price": price,
+                        "fair_price": Decimal("0.00"),
                         "liquidity": 5,
                     }
                     await self.db.insert_or_update_lot(lot)
@@ -267,10 +273,6 @@ class Scheduler:
             except Exception as e:
                 logging.exception("Scheduler loop error: %s", e)
                 await asyncio.sleep(60)
-
-# -----------------------------
-# Telegram-бот: команди та хендлери
-# -----------------------------
 async def set_commands(bot: Bot):
     commands = [
         BotCommand(command="start", description="Запустити бота"),
@@ -279,6 +281,9 @@ async def set_commands(bot: Bot):
         BotCommand(command="mute", description="Режим тиші увімк/вимк"),
     ]
     await bot.set_my_commands(commands)
+
+async def on_startup(bot: Bot):
+    await bot.set_webhook(f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/webhook")
 
 async def main():
     logging.info("Запуск Watch-Expert AI Pro v4.1")
@@ -317,6 +322,7 @@ async def main():
         file_bytes = await m.bot.download_file(file.file_path)
         img_bytes = file_bytes.read()
         analysis = await vision.analyze(img_bytes)
+        tags = auto_tags(m.caption or "")
         await m.answer(
             f"AI Vision+ результат:\n"
             f"- Механізм: {analysis['movement']}\n"
@@ -327,18 +333,26 @@ async def main():
             f"- Люмінофор: {analysis.get('lume', {}).get('quality')}\n"
             f"- Комплект: {analysis.get('kit')}\n"
             f"- Франкен: {analysis.get('franken')}\n"
+            f"- Автотеги: {' '.join(tags)}"
         )
 
     @dp.message(F.text.regexp(r"^https?://"))
     async def link_handler(m: Message):
-        await m.answer("🔎 Прийнято. Аналізую лот...")
+        flags = text_flags(m.text)
+        await m.answer(f"🔎 Прийнято. Аналізую лот...\nСтоп-слова: {flags['stop_words']}")
 
     # Планувальник
-    scraper = Scraper(settings.PROXY_POOL)
+    scraper = Scraper()
     scheduler = Scheduler(bot=bot, db=db, scraper=scraper)
     await scheduler.start()
 
-    await dp.start_polling(bot)
+    # Запуск aiohttp‑сервера
+    app = web.Application()
+    SimpleRequestHandler(dp, bot).register(app, path="/webhook")
+    setup_application(app, dp, bot=bot)
+
+    port = int(os.getenv("PORT", 8080))
+    web.run_app(app, host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
     asyncio.run(main())
