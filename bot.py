@@ -1,75 +1,64 @@
-```python
-import os
-import re
-import json
-import time
-import random
-import logging
-import asyncio
-import asyncpg
-import aiohttp
-from io import BytesIO
-from datetime import datetime
-from typing import List, Dict, Any, Optional
+# ==============================================================================
+# Watch-Expert AI Pro v7.0 [Final Release]
+# Core: Gemini Vision | Empress Collector | OLX Deep Scan | AsyncPG | Telegram
+# ==============================================================================
 
+import os
+import sys
+import json
+import asyncio
+import logging
+import random
+import re
+import aiohttp
+import asyncpg
+from datetime import datetime, timedelta
+from io import BytesIO
 from PIL import Image, ImageEnhance, ImageFilter
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from google import genai
 
+# --- CONFIGURATION ---
 load_dotenv()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")
+CHANNEL_ID = os.getenv("CHANNEL_ID")
+ADMIN_ID = os.getenv("ADMIN_CHAT_ID")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:pass@localhost:5432/watchdb")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID") or 0)
-ADMIN_ID = int(os.getenv("ADMIN_CHAT_ID") or 0)
-IMG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "empress_images")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+IMG_DIR = os.path.join(BASE_DIR, "empress_images")
 os.makedirs(IMG_DIR, exist_ok=True)
 
-EMPRESS_BASE = "https://empress.cc"
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.1 Safari/605.1.15"
-]
-PROXIES = [p for p in (os.getenv("HTTP_PROXIES") or "").split(",") if p]
-SCAN_CONCURRENCY = int(os.getenv("SCAN_CONCURRENCY", "4"))
-RATE_API = os.getenv("CURRENCY_API_URL", "")
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("WatchExpert_v7")
 
-# -------------------------
-# Database
-# -------------------------
+# --- AI CLIENT ---
+ai_client = genai.Client(api_key=GEMINI_API_KEY)
+AI_MODEL = "gemini-1.5-flash"
+
+# --- DATABASE LAYER ---
 async def create_pool():
     return await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
 
-async def init_schema(pool: asyncpg.Pool):
+async def init_schema(pool):
     async with pool.acquire() as conn:
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS empress_collections (
-                id SERIAL PRIMARY KEY,
-                path TEXT UNIQUE,
-                title TEXT,
-                fetched_at TIMESTAMP DEFAULT NOW()
-            );
             CREATE TABLE IF NOT EXISTS empress_watches (
                 id SERIAL PRIMARY KEY,
-                empress_id TEXT UNIQUE,
                 name TEXT,
                 collection TEXT,
                 price NUMERIC,
-                currency TEXT,
+                currency TEXT DEFAULT 'USD',
                 image_path TEXT,
-                details JSONB,
-                created_at TIMESTAMP DEFAULT NOW(),
+                features JSONB,
                 last_updated TIMESTAMP DEFAULT NOW()
             );
             CREATE TABLE IF NOT EXISTS olx_archive (
@@ -89,461 +78,285 @@ async def init_schema(pool: asyncpg.Pool):
             );
         """)
 
-# -------------------------
-# Utilities
-# -------------------------
-def choose_proxy() -> Optional[str]:
-    return random.choice(PROXIES) if PROXIES else None
-
-def sanitize_filename(s: str) -> str:
-    return re.sub(r'[^a-zA-Z0-9_\-\.]', '_', s)[:120]
-
-async def fetch_text(session: aiohttp.ClientSession, url: str, headers=None, proxy=None, timeout=20) -> Optional[str]:
-    try:
-        async with session.get(url, headers=headers, proxy=proxy, timeout=timeout) as r:
-            if r.status == 200:
-                return await r.text()
-            logger.debug("fetch_text non-200 %s %s", url, r.status)
-    except Exception as e:
-        logger.debug("fetch_text error %s %s", url, e)
-    return None
-
-async def fetch_bytes(session: aiohttp.ClientSession, url: str, headers=None, proxy=None, timeout=30) -> Optional[bytes]:
-    try:
-        async with session.get(url, headers=headers, proxy=proxy, timeout=timeout) as r:
-            if r.status == 200:
-                return await r.read()
-            logger.debug("fetch_bytes non-200 %s %s", url, r.status)
-    except Exception as e:
-        logger.debug("fetch_bytes error %s %s", url, e)
-    return None
-
-async def save_image(bytes_data: bytes, name_hint: str) -> str:
-    fname = sanitize_filename(f"{name_hint}_{int(time.time())}_{random.randint(1000,9999)}.jpg")
-    path = os.path.join(IMG_DIR, fname)
-    try:
-        with open(path, "wb") as f:
-            f.write(bytes_data)
-        return path
-    except Exception as e:
-        logger.error("save_image error: %s", e)
-        return ""
-
-async def upscale_image_local(image_bytes: bytes) -> bytes:
+# --- UTILITIES ---
+async def upscale_image(image_bytes: bytes) -> bytes:
     loop = asyncio.get_running_loop()
-    def proc():
+    def process():
         img = Image.open(BytesIO(image_bytes)).convert("RGB")
         img = img.filter(ImageFilter.SHARPEN)
-        img = ImageEnhance.Contrast(img).enhance(1.12)
+        enhancer = ImageEnhance.Contrast(img)
+        img = enhancer.enhance(1.2)
         bio = BytesIO()
-        img.save(bio, format="JPEG", quality=92)
+        img.save(bio, format="JPEG", quality=95)
         return bio.getvalue()
-    return await loop.run_in_executor(None, proc)
+    return await loop.run_in_executor(None, process)
 
-async def get_currency_rate() -> float:
+async def get_currency_rate():
+    # Placeholder for NBU/Bank API
+    return 41.50
+
+async def fetch_html(session, url):
     try:
-        if RATE_API:
-            async with aiohttp.ClientSession() as s:
-                async with s.get(RATE_API, timeout=8) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        return float(data.get("rate", 41.5))
-    except Exception:
-        pass
-    return 41.5
+        async with session.get(url, timeout=20) as resp:
+            if resp.status == 200: return await resp.text()
+    except Exception: return None
 
-# -------------------------
-# AI placeholder
-# -------------------------
-async def analyze_image_ai(image_bytes: bytes) -> Dict[str, Any]:
-    return {
-        "brand": "Unknown",
-        "model": "",
-        "authenticity": "SUSPICIOUS",
-        "confidence": 50,
-        "mechanism": "AUTOMATIC",
-        "defects": [],
-        "estimated_market_price_usd": 0,
-        "liquidity_rating": 5,
-        "is_male": True
+# --- MODULE 1: AI CORE ---
+def build_prompt():
+    return """
+    ACT AS: Horology Expert.
+    TASK: Analyze watch image.
+    RETURN JSON ONLY:
+    {
+        "brand": "String",
+        "model": "String",
+        "authenticity": "ORIGINAL" | "SUSPICIOUS" | "FAKE",
+        "confidence": 0-100,
+        "mechanism": "QUARTZ" | "MECHANICAL" | "AUTOMATIC",
+        "defects": ["scratch_glass", "worn_strap", "dial_misalignment"],
+        "estimated_market_price_usd": Number,
+        "liquidity_rating": 1-10,
+        "is_male": true/false
     }
+    """
 
-# -------------------------
-# Empress scraper (robust)
-# -------------------------
-async def list_collections(session: aiohttp.ClientSession) -> List[Dict[str, str]]:
-    headers = {"User-Agent": random.choice(USER_AGENTS)}
-    html = await fetch_text(session, f"{EMPRESS_BASE}/collections", headers=headers, proxy=choose_proxy())
-    if not html:
-        logger.warning("list_collections: no html from collections page")
-        return []
-    soup = BeautifulSoup(html, "html.parser")
-    links = []
-    seen = set()
-    for a in soup.select("a[href^='/collections/']"):
-        href = a.get("href")
-        if not href:
-            continue
-        if href in seen:
-            continue
-        seen.add(href)
-        title = a.get_text(strip=True) or href.split("/")[-1]
-        links.append({"path": href, "title": title})
-    logger.info("Found %d collections", len(links))
-    return links
-
-def extract_img_src(img_tag) -> Optional[str]:
-    if not img_tag:
-        return None
-    for attr in ("src", "data-src", "data-srcset", "srcset", "data-lazy-src"):
-        val = img_tag.get(attr)
-        if val:
-            if "," in val:
-                parts = [p.strip() for p in val.split(",") if p.strip()]
-                last = parts[-1]
-                url = last.split(" ")[0]
-            else:
-                url = val
-            if url.startswith("//"):
-                url = "https:" + url
-            return url
-    return None
-
-def parse_price_text(price_txt: str) -> float:
-    if not price_txt:
-        return 0.0
-    txt = price_txt.replace("\u00A0", "").replace(",", ".")
-    num = re.sub(r"[^\d\.]", "", txt)
+async def analyze_image_ai(image_bytes: bytes):
     try:
-        return float(num) if num else 0.0
-    except Exception:
-        return 0.0
+        response = ai_client.models.generate_content(
+            model=AI_MODEL,
+            contents=[{"mime_type": "image/jpeg", "data": image_bytes}, build_prompt()]
+        )
+        clean = response.text.replace("```json", "").replace("```", "").strip()
+        return json.loads(clean)
+    except Exception as e:
+        logger.error(f"AI Analysis Error: {e}")
+        return None
 
-async def fetch_collection_products(session: aiohttp.ClientSession, col_path: str) -> List[Dict[str, Any]]:
-    page = 1
-    results = []
-    headers = {"User-Agent": random.choice(USER_AGENTS)}
-    while True:
-        url = f"{EMPRESS_BASE}{col_path}?page={page}"
-        html = await fetch_text(session, url, headers=headers, proxy=choose_proxy())
-        if not html:
-            break
-        soup = BeautifulSoup(html, "html.parser")
-        products = soup.select(".grid-product__content, .product-card, .product-item, .product-grid-item")
-        if not products:
-            ld = []
-            for script in soup.select("script[type='application/ld+json']"):
-                try:
-                    ld.append(json.loads(script.string or "{}"))
-                except Exception:
-                    continue
-            if ld:
-                for item in ld:
-                    if isinstance(item, dict) and item.get("@type") in ("Product",):
-                        title = item.get("name", "Unknown")
-                        price = 0.0
-                        offers = item.get("offers") or {}
-                        price = float(offers.get("price", 0)) if offers else 0.0
-                        img = item.get("image")
-                        results.append({"title": title, "price": price, "img": img, "url": item.get("url")})
-            break
-        for p in products:
-            try:
-                title_tag = p.select_one(".grid-product__title, .product-title, .card-title, h3, h2")
-                price_tag = p.select_one(".grid-product__price, .price, .card-price, .product-price")
-                img_tag = p.select_one("img")
-                link_tag = p.select_one("a[href]")
-                title = title_tag.get_text(strip=True) if title_tag else "Unknown"
-                price_txt = price_tag.get_text(strip=True) if price_tag else ""
-                price = parse_price_text(price_txt)
-                img_src = extract_img_src(img_tag)
-                product_url = None
-                if link_tag:
-                    href = link_tag.get("href")
-                    if href:
-                        product_url = href if href.startswith("http") else EMPRESS_BASE + href
-                results.append({
-                    "title": title,
-                    "price": price,
-                    "img": img_src,
-                    "url": product_url
-                })
-            except Exception:
-                continue
-        page += 1
-        await asyncio.sleep(0.4)
-    return results
+# --- MODULE 2: EMPRESS COLLECTOR ---
+EMPRESS_URL = "https://empress.cc"
 
-async def fetch_product_details(session: aiohttp.ClientSession, product_url: str) -> Dict[str, Any]:
-    if not product_url:
-        return {}
-    headers = {"User-Agent": random.choice(USER_AGENTS)}
-    html = await fetch_text(session, product_url, headers=headers, proxy=choose_proxy())
-    if not html:
-        return {}
-    soup = BeautifulSoup(html, "html.parser")
-    details: Dict[str, Any] = {}
-    desc = soup.select_one(".product-single__description, .description, .product-description")
-    if desc:
-        details["description"] = desc.get_text(strip=True)
-    specs = {}
-    for row in soup.select(".specs tr, .product-specs li, .product-attributes li"):
-        try:
-            k = row.select_one("th, .spec-key, .attr-key") or row.select_one("b")
-            v = row.select_one("td, .spec-value, .attr-value")
-            if k and v:
-                specs[k.get_text(strip=True)] = v.get_text(strip=True)
-        except Exception:
-            continue
-    if specs:
-        details["specs"] = specs
-    for script in soup.select("script[type='application/ld+json']"):
-        try:
-            data = json.loads(script.string or "{}")
-            if isinstance(data, dict) and data.get("@type") == "Product":
-                details.setdefault("jsonld", data)
-                break
-        except Exception:
-            continue
-    return details
-
-async def sync_empress_all(pool: asyncpg.Pool):
-    logger.info("Empress sync started")
+async def sync_empress_all(pool):
+    logger.info("🔄 Empress.cc Sync Started")
     async with aiohttp.ClientSession() as session:
-        collections = await list_collections(session)
-        if not collections:
-            logger.warning("No collections found")
-            return
-        async with pool.acquire() as conn:
-            for col in collections:
-                await conn.execute("""
-                    INSERT INTO empress_collections (path, title) VALUES ($1, $2)
-                    ON CONFLICT (path) DO UPDATE SET title = EXCLUDED.title, fetched_at = NOW()
-                """, col["path"], col["title"])
-        sem = asyncio.Semaphore(SCAN_CONCURRENCY)
-        async def process_collection(col):
-            async with sem:
-                try:
-                    products = await fetch_collection_products(session, col["path"])
-                    logger.info("Collection %s: %d products", col["path"], len(products))
-                    for p in products:
-                        img_path = ""
-                        if p.get("img"):
-                            b = await fetch_bytes(session, p["img"], headers={"User-Agent": random.choice(USER_AGENTS)}, proxy=choose_proxy())
-                            if b:
-                                try:
-                                    up = await upscale_image_local(b)
-                                    img_path = await save_image(up, p["title"])
-                                except Exception:
-                                    img_path = await save_image(b, p["title"])
-                        details = {}
-                        if p.get("url"):
-                            details = await fetch_product_details(session, p["url"])
-                        empress_id = p.get("url") or f"{col['path']}#{p['title']}"
-                        async with pool.acquire() as conn:
-                            await conn.execute("""
-                                INSERT INTO empress_watches (empress_id, name, collection, price, currency, image_path, details)
-                                VALUES ($1,$2,$3,$4,$5,$6,$7)
-                                ON CONFLICT (empress_id) DO UPDATE
-                                  SET name=EXCLUDED.name, price=EXCLUDED.price, image_path=EXCLUDED.image_path, details=EXCLUDED.details, last_updated=NOW()
-                            """, empress_id, p["title"], col["title"], p["price"], "USD", img_path, json.dumps({"source_url": p.get("url"), **(details or {})}))
-                except Exception as e:
-                    logger.error("process_collection error %s %s", col.get("path"), e)
-        tasks = [process_collection(c) for c in collections]
-        await asyncio.gather(*tasks)
-    logger.info("Empress sync completed")
+        html = await fetch_html(session, f"{EMPRESS_URL}/collections")
+        if not html: return
+        soup = BeautifulSoup(html, "html.parser")
+        collections = list(set([a['href'] for a in soup.select("a[href^='/collections/']") if 'all' not in a['href']]))
 
-# -------------------------
-# OLX scanner (kept robust)
-# -------------------------
-async def scan_olx(pool: asyncpg.Pool, bot: Bot):
+        for col_path in collections:
+            page = 1
+            while True:
+                url = f"{EMPRESS_URL}{col_path}?page={page}"
+                c_html = await fetch_html(session, url)
+                if not c_html: break
+                
+                c_soup = BeautifulSoup(c_html, "html.parser")
+                products = c_soup.select(".grid-product__content")
+                if not products: break
+
+                for p in products:
+                    try:
+                        title = p.select_one(".grid-product__title").text.strip()
+                        price_tag = p.select_one(".grid-product__price")
+                        price = float(re.sub(r"[^\d.]", "", price_tag.text)) if price_tag else 0
+                        img_tag = p.select_one("img")
+                        
+                        if img_tag:
+                            img_src = img_tag['src']
+                            if img_src.startswith("//"): img_src = "https:" + img_src
+                            
+                            fname = f"{re.sub(r'[^a-zA-Z0-9]', '', title)[:20]}_{random.randint(1000,9999)}.jpg"
+                            fpath = os.path.join(IMG_DIR, fname)
+                            
+                            if not os.path.exists(fpath):
+                                async with session.get(img_src) as i_resp:
+                                    if i_resp.status == 200:
+                                        with open(fpath, "wb") as f:
+                                            f.write(await i_resp.read())
+
+                            async with pool.acquire() as conn:
+                                await conn.execute("""
+                                    INSERT INTO empress_watches (name, collection, price, image_path)
+                                    VALUES ($1, $2, $3, $4)
+                                    ON CONFLICT DO NOTHING
+                                """, title, col_path, price, fpath)
+                    except Exception: continue
+                page += 1
+                await asyncio.sleep(1)
+
+# --- MODULE 3: OLX SCANNER ---
+USER_AGENTS = ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0"]
+
+async def scan_olx_v7(pool, bot: Bot):
+    logger.info("📡 OLX Scanner v7.0 Active")
     queries = ["годинник", "часы", "seiko", "tissot", "orient"]
-    base_sleep = 30
+    
     while True:
-        try:
-            async with aiohttp.ClientSession() as session:
-                for q in queries:
-                    url = f"https://www.olx.ua/uk/list/q-{q}/"
+        async with aiohttp.ClientSession() as session:
+            for query in queries:
+                url = f"https://www.olx.ua/uk/list/q-{query}/?search%5Bfilter_float_price%3Afrom%5D=2000"
+                try:
                     headers = {"User-Agent": random.choice(USER_AGENTS)}
-                    html = await fetch_text(session, url, headers=headers, proxy=choose_proxy())
-                    if not html:
-                        continue
-                    soup = BeautifulSoup(html, "html.parser")
-                    cards = soup.select("div[data-cy='l-card'], .offer-wrapper, .css-1sw7q4x, .css-1bbgabe")
-                    for card in cards[:6]:
-                        try:
-                            link_tag = card.select_one("a[href]")
-                            if not link_tag:
-                                continue
-                            link = link_tag.get("href")
-                            if not link.startswith("http"):
-                                link = "https://www.olx.ua" + link
-                            async with pool.acquire() as conn:
-                                exists = await conn.fetchval("SELECT 1 FROM olx_archive WHERE url=$1", link)
-                                if exists:
-                                    continue
-                            title_el = card.select_one("h6") or card.select_one(".offer-title") or card.select_one(".css-1bbgabe")
-                            title = title_el.get_text(strip=True) if title_el else "No title"
-                            price_tag = card.select_one("[data-testid='ad-price']") or card.select_one(".price")
-                            price = parse_price_text(price_tag.get_text()) if price_tag else 0.0
-                            img_tag = card.select_one("img")
-                            img_url = extract_img_src(img_tag)
-                            ai_result = {}
-                            if img_url:
-                                b = await fetch_bytes(session, img_url, headers=headers, proxy=choose_proxy())
-                                if b:
-                                    ai_result = await analyze_image_ai(b)
-                            is_deal = False
-                            est_uah = 0
-                            if ai_result:
-                                usd = ai_result.get("estimated_market_price_usd", 0)
-                                rate = await get_currency_rate()
-                                est_uah = usd * rate
-                                is_deal = (est_uah / 3) - price > 3000
-                            if is_deal and ai_result.get("authenticity") == "ORIGINAL":
-                                try:
-                                    await bot.send_message(
-                                        CHANNEL_ID,
-                                        f"🚨 <b>SUPER DEAL</b>\n{title}\nPrice: {price} UAH\nEst Market: {int(est_uah)} UAH\nAI: {ai_result.get('brand')} ({ai_result.get('authenticity')})\n{link}",
-                                        parse_mode=ParseMode.HTML
-                                    )
-                                except Exception:
-                                    pass
-                            async with pool.acquire() as conn:
-                                await conn.execute(
-                                    "INSERT INTO olx_archive (url, title, price, ai_verdict, status) VALUES ($1,$2,$3,$4,$5)",
-                                    link, title, price, json.dumps(ai_result), "PROCESSED"
-                                )
-                        except Exception:
-                            continue
-                    await asyncio.sleep(random.randint(4, 12))
-            await asyncio.sleep(base_sleep + random.randint(0, 60))
-        except Exception as e:
-            logger.error("OLX scanner error: %s", e)
-            await asyncio.sleep(60)
+                    async with session.get(url, headers=headers) as resp:
+                        if resp.status != 200: continue
+                        html = await resp.text()
 
-# -------------------------
-# Telegram bot
-# -------------------------
+                    soup = BeautifulSoup(html, "html.parser")
+                    cards = soup.select("div[data-cy='l-card']")
+
+                    for card in cards[:3]:
+                        link_tag = card.select_one("a")
+                        if not link_tag: continue
+                        link = link_tag['href']
+                        if not link.startswith("http"): link = f"https://www.olx.ua{link}"
+
+                        async with pool.acquire() as conn:
+                            exists = await conn.fetchval("SELECT 1 FROM olx_archive WHERE url=$1", link)
+                            if exists: continue
+
+                        title = card.select_one("h6").text.strip()
+                        price_txt = card.select_one("[data-testid='ad-price']")
+                        price = float(re.sub(r"[^\d]", "", price_txt.text)) if price_txt else 0
+                        
+                        img_tag = card.select_one("img")
+                        img_url = img_tag.get('src') or img_tag.get('data-src')
+
+                        ai_result = {}
+                        is_deal = False
+                        est_uah = 0
+
+                        if img_url:
+                            async with session.get(img_url) as img_resp:
+                                if img_resp.status == 200:
+                                    img_bytes = await img_resp.read()
+                                    ai_result = await analyze_image_ai(img_bytes)
+
+                        if ai_result:
+                            usd_rate = await get_currency_rate()
+                            est_uah = ai_result.get("estimated_market_price_usd", 0) * usd_rate
+                            if est_uah > 0:
+                                is_deal = (est_uah / 3) - price > 3000
+
+                        if is_deal and ai_result.get("authenticity") == "ORIGINAL":
+                            await bot.send_message(
+                                CHANNEL_ID,
+                                f"🚨 <b>SUPER DEAL FOUND!</b>\n\n⌚ <b>{title}</b>\n💰 Price: {price} UAH\n📉 Est. Market: {int(est_uah)} UAH\n💎 AI: {ai_result.get('brand')} ({ai_result.get('authenticity')})\n👉 {link}",
+                                parse_mode=ParseMode.HTML
+                            )
+
+                        async with pool.acquire() as conn:
+                            await conn.execute(
+                                "INSERT INTO olx_archive (url, title, price, ai_verdict, status) VALUES ($1, $2, $3, $4, 'PROCESSED')",
+                                link, title, price, json.dumps(ai_result)
+                            )
+                        await asyncio.sleep(random.randint(3, 7))
+
+                except Exception as e:
+                    logger.error(f"Scan Loop Error: {e}")
+                
+                await asyncio.sleep(random.randint(20, 40))
+        await asyncio.sleep(300)
+
+# --- MODULE 4: TELEGRAM BOT ---
 bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-@dp.message.register(CommandStart())
+@dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     kb = InlineKeyboardBuilder()
     kb.button(text="🔍 Scan Photo", callback_data="scan_mode")
     kb.button(text="📊 Stats", callback_data="stats")
-    kb.button(text="⚙️ Admin", callback_data="admin")
-    await message.answer("⌚ <b>Watch-Expert AI v7.0</b>\nSystem Online.", reply_markup=kb.as_markup())
+    await message.answer("⌚ <b>Watch-Expert AI v7.0</b>\nSystem is Online.", reply_markup=kb.as_markup())
 
-@dp.callback_query.register(F.data == "stats")
-async def cb_stats(callback: types.CallbackQuery):
-    pool = dp.data.get("db_pool")
-    scanned = empress = 0
-    if pool:
-        async with pool.acquire() as conn:
-            scanned = await conn.fetchval("SELECT COUNT(*) FROM olx_archive")
-            empress = await conn.fetchval("SELECT COUNT(*) FROM empress_watches")
-    await callback.message.edit_text(f"📊 <b>System Stats</b>\n\nOLX Scanned: {scanned}\nEmpress DB: {empress}")
+@dp.callback_query(F.data == "stats")
+async def cb_stats(callback: types.CallbackQuery, db_pool: asyncpg.Pool):
+    async with db_pool.acquire() as conn:
+        scanned = await conn.fetchval("SELECT COUNT(*) FROM olx_archive")
+        empress = await conn.fetchval("SELECT COUNT(*) FROM empress_watches")
+    await callback.message.edit_text(f"📊 <b>System Stats</b>\n\n📡 OLX Scanned: {scanned}\n📚 Empress DB: {empress}")
 
-@dp.callback_query.register(F.data == "admin")
-async def cb_admin(callback: types.CallbackQuery):
-    await callback.message.answer("Admin commands: /sync_empress /report /health")
-
-@dp.message.register(Command("sync_empress"))
-async def cmd_sync_empress(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.reply("Unauthorized")
-        return
-    await message.reply("Starting Empress sync...")
-    pool = dp.data.get("db_pool")
-    if pool:
-        asyncio.create_task(sync_empress_all(pool))
-
-@dp.message.register(Command("report"))
-async def cmd_report(message: types.Message):
-    pool = dp.data.get("db_pool")
-    count = 0
-    if pool:
-        async with pool.acquire() as conn:
-            count = await conn.fetchval("SELECT COUNT(*) FROM empress_watches")
-    await message.reply(f"Empress items: {count}")
-
-@dp.message.register(Command("health"))
-async def cmd_health(message: types.Message):
-    try:
-        me = await bot.get_me()
-        await message.reply(f"Bot OK: @{me.username}")
-    except Exception as e:
-        await message.reply(f"Health error: {e}")
-
-@dp.message.register(F.photo)
-async def handle_photo(message: types.Message):
-    status = await message.answer("⏳ Processing image...")
+@dp.message(F.photo)
+async def handle_photo(message: types.Message, db_pool: asyncpg.Pool):
+    status_msg = await message.answer("⏳ <b>Processing:</b> Upscaling & Deep Vision Analysis...")
+    
     file_id = message.photo[-1].file_id
     f = await bot.get_file(file_id)
-    io = BytesIO()
-    await bot.download_file(f.file_path, io)
-    img_bytes = io.getvalue()
-    up = await upscale_image_local(img_bytes)
-    ai = await analyze_image_ai(up)
-    if not ai:
-        await status.edit_text("❌ AI analysis failed.")
+    io_obj = BytesIO()
+    await bot.download_file(f.file_path, io_obj)
+    high_res_bytes = await upscale_image(io_obj.getvalue())
+
+    ai_data = await analyze_image_ai(high_res_bytes)
+    if not ai_data:
+        await status_msg.edit_text("❌ AI Analysis Failed.")
         return
+
+    async with db_pool.acquire() as conn:
+        refs = await conn.fetch("""
+            SELECT name, price FROM empress_watches 
+            WHERE name ILIKE $1 ORDER BY price DESC LIMIT 3
+        """, f"%{ai_data.get('brand', 'xxx')}%")
+
     rate = await get_currency_rate()
-    est_uah = int(ai.get("estimated_market_price_usd", 0) * rate)
+    est_uah = ai_data.get('estimated_market_price_usd', 0) * rate
+    
     report = (
         f"🕵️ <b>EXPERT REPORT</b>\n"
-        f"Brand: {ai.get('brand')} {ai.get('model')}\n"
-        f"Mechanism: {ai.get('mechanism')}\n"
-        f"Authenticity: {ai.get('authenticity')} ({ai.get('confidence')}%)\n"
-        f"Defects: {', '.join(ai.get('defects', []))}\n"
-        f"Est Market: ${ai.get('estimated_market_price_usd')} (~{est_uah} UAH)\n"
-        f"Liquidity: {ai.get('liquidity_rating')}/10\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"🏷 <b>Brand:</b> {ai_data.get('brand')} {ai_data.get('model')}\n"
+        f"⚙️ <b>Mechanism:</b> {ai_data.get('mechanism')}\n"
+        f"💎 <b>Authenticity:</b> {ai_data.get('authenticity')} ({ai_data.get('confidence')}%) \n"
+        f"⚠️ <b>Defects:</b> {', '.join(ai_data.get('defects', []))}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"💵 <b>Est. Market:</b> ${ai_data.get('estimated_market_price_usd')} (~{int(est_uah)} UAH)\n"
+        f"🌊 <b>Liquidity:</b> {ai_data.get('liquidity_rating')}/10\n"
     )
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🔎 Chrono24", url=f"https://www.chrono24.com/search/index.htm?query={ai.get('brand')}+{ai.get('model')}")
-    await status.edit_text(report, reply_markup=kb.as_markup())
 
-# -------------------------
-# Health & Reports
-# -------------------------
+    if refs:
+        report += "\n📚 <b>Empress.cc Reference:</b>\n"
+        for r in refs:
+            report += f"• {r['name']} (${r['price']})\n"
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔎 Search Chrono24", url=f"https://www.chrono24.com/search/index.htm?query={ai_data.get('brand')}+{ai_data.get('model')}")
+    
+    await status_msg.edit_text(report, reply_markup=kb.as_markup())
+
+# --- MODULE 5: HEALTH & REPORTS ---
 async def health_check_loop(bot: Bot):
     while True:
         try:
             await bot.get_me()
-            logger.info("Health OK")
+            logger.info("✅ Health Check OK")
         except Exception as e:
-            logger.error("Health failed: %s", e)
+            logger.error(f"Health Check Failed: {e}")
+        await asyncio.sleep(43200)
+
+async def generate_weekly_report(pool, bot: Bot):
+    while True:
+        now = datetime.now()
+        if now.weekday() == 6 and now.hour == 20:
+             async with pool.acquire() as conn:
+                 count = await conn.fetchval("SELECT COUNT(*) FROM olx_archive WHERE detected_at > NOW() - INTERVAL '7 days'")
+                 if count > 0:
+                    await bot.send_message(ADMIN_ID, f"📄 <b>Weekly Report:</b>\nProcessed {count} items.")
         await asyncio.sleep(3600)
 
-async def weekly_report_loop(pool: asyncpg.Pool, bot: Bot):
-    while True:
-        now = datetime.utcnow()
-        if now.weekday() == 6 and 19 <= now.hour <= 20:
-            async with pool.acquire() as conn:
-                count = await conn.fetchval("SELECT COUNT(*) FROM olx_archive WHERE detected_at > NOW() - INTERVAL '7 days'")
-                if count and ADMIN_ID:
-                    await bot.send_message(ADMIN_ID, f"📄 Weekly Report: processed {count} items.")
-        await asyncio.sleep(1800)
-
-# -------------------------
-# Entry point
-# -------------------------
+# --- ENTRY POINT ---
 async def main():
     pool = await create_pool()
     await init_schema(pool)
-    dp.data["db_pool"] = pool
+    
+    # Start Background Workers
     asyncio.create_task(sync_empress_all(pool))
-    asyncio.create_task(scan_olx(pool, bot))
+    asyncio.create_task(scan_olx_v7(pool, bot))
     asyncio.create_task(health_check_loop(bot))
-    asyncio.create_task(weekly_report_loop(pool, bot))
+    asyncio.create_task(generate_weekly_report(pool, bot))
+
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, db_pool=pool)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Shutdown")
-```
+        logger.info("System Shutdown.")
