@@ -1,3 +1,4 @@
+```python
 import os
 import re
 import json
@@ -16,7 +17,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -155,7 +156,6 @@ async def get_currency_rate() -> float:
 # AI placeholder
 # -------------------------
 async def analyze_image_ai(image_bytes: bytes) -> Dict[str, Any]:
-    # Placeholder for Gemini Vision + fallback integration
     return {
         "brand": "Unknown",
         "model": "",
@@ -198,7 +198,6 @@ def extract_img_src(img_tag) -> Optional[str]:
     for attr in ("src", "data-src", "data-srcset", "srcset", "data-lazy-src"):
         val = img_tag.get(attr)
         if val:
-            # handle srcset: take last candidate
             if "," in val:
                 parts = [p.strip() for p in val.split(",") if p.strip()]
                 last = parts[-1]
@@ -232,7 +231,6 @@ async def fetch_collection_products(session: aiohttp.ClientSession, col_path: st
         soup = BeautifulSoup(html, "html.parser")
         products = soup.select(".grid-product__content, .product-card, .product-item, .product-grid-item")
         if not products:
-            # try schema.org JSON-LD fallback
             ld = []
             for script in soup.select("script[type='application/ld+json']"):
                 try:
@@ -299,7 +297,6 @@ async def fetch_product_details(session: aiohttp.ClientSession, product_url: str
             continue
     if specs:
         details["specs"] = specs
-    # try JSON-LD product data
     for script in soup.select("script[type='application/ld+json']"):
         try:
             data = json.loads(script.string or "{}")
@@ -431,7 +428,7 @@ async def scan_olx(pool: asyncpg.Pool, bot: Bot):
 bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-@dp.message(CommandStart())
+@dp.message.register(CommandStart())
 async def cmd_start(message: types.Message):
     kb = InlineKeyboardBuilder()
     kb.button(text="🔍 Scan Photo", callback_data="scan_mode")
@@ -439,19 +436,49 @@ async def cmd_start(message: types.Message):
     kb.button(text="⚙️ Admin", callback_data="admin")
     await message.answer("⌚ <b>Watch-Expert AI v7.0</b>\nSystem Online.", reply_markup=kb.as_markup())
 
-@dp.callback_query(F.data == "stats")
-async def cb_stats(callback: types.CallbackQuery, db_pool: asyncpg.Pool):
-    async with db_pool.acquire() as conn:
-        scanned = await conn.fetchval("SELECT COUNT(*) FROM olx_archive")
-        empress = await conn.fetchval("SELECT COUNT(*) FROM empress_watches")
+@dp.callback_query.register(F.data == "stats")
+async def cb_stats(callback: types.CallbackQuery):
+    pool = dp.data.get("db_pool")
+    scanned = empress = 0
+    if pool:
+        async with pool.acquire() as conn:
+            scanned = await conn.fetchval("SELECT COUNT(*) FROM olx_archive")
+            empress = await conn.fetchval("SELECT COUNT(*) FROM empress_watches")
     await callback.message.edit_text(f"📊 <b>System Stats</b>\n\nOLX Scanned: {scanned}\nEmpress DB: {empress}")
 
-@dp.callback_query(F.data == "admin")
+@dp.callback_query.register(F.data == "admin")
 async def cb_admin(callback: types.CallbackQuery):
     await callback.message.answer("Admin commands: /sync_empress /report /health")
 
-@dp.message(F.photo)
-async def handle_photo(message: types.Message, db_pool: asyncpg.Pool):
+@dp.message.register(Command("sync_empress"))
+async def cmd_sync_empress(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.reply("Unauthorized")
+        return
+    await message.reply("Starting Empress sync...")
+    pool = dp.data.get("db_pool")
+    if pool:
+        asyncio.create_task(sync_empress_all(pool))
+
+@dp.message.register(Command("report"))
+async def cmd_report(message: types.Message):
+    pool = dp.data.get("db_pool")
+    count = 0
+    if pool:
+        async with pool.acquire() as conn:
+            count = await conn.fetchval("SELECT COUNT(*) FROM empress_watches")
+    await message.reply(f"Empress items: {count}")
+
+@dp.message.register(Command("health"))
+async def cmd_health(message: types.Message):
+    try:
+        me = await bot.get_me()
+        await message.reply(f"Bot OK: @{me.username}")
+    except Exception as e:
+        await message.reply(f"Health error: {e}")
+
+@dp.message.register(F.photo)
+async def handle_photo(message: types.Message):
     status = await message.answer("⏳ Processing image...")
     file_id = message.photo[-1].file_id
     f = await bot.get_file(file_id)
@@ -501,48 +528,22 @@ async def weekly_report_loop(pool: asyncpg.Pool, bot: Bot):
         await asyncio.sleep(1800)
 
 # -------------------------
-# Admin commands
-# -------------------------
-@dp.message(commands=["sync_empress"])
-async def cmd_sync_empress(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.reply("Unauthorized")
-        return
-    await message.reply("Starting Empress sync...")
-    # schedule background sync
-    asyncio.create_task(sync_empress_all(dp.data.get("db_pool")))
-
-@dp.message(commands=["report"])
-async def cmd_report(message: types.Message, db_pool: asyncpg.Pool):
-    async with db_pool.acquire() as conn:
-        count = await conn.fetchval("SELECT COUNT(*) FROM empress_watches")
-    await message.reply(f"Empress items: {count}")
-
-@dp.message(commands=["health"])
-async def cmd_health(message: types.Message):
-    try:
-        me = await bot.get_me()
-        await message.reply(f"Bot OK: @{me.username}")
-    except Exception as e:
-        await message.reply(f"Health error: {e}")
-
-# -------------------------
 # Entry point
 # -------------------------
 async def main():
     pool = await create_pool()
     await init_schema(pool)
     dp.data["db_pool"] = pool
-    # start background tasks
     asyncio.create_task(sync_empress_all(pool))
     asyncio.create_task(scan_olx(pool, bot))
     asyncio.create_task(health_check_loop(bot))
     asyncio.create_task(weekly_report_loop(pool, bot))
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot, db_pool=pool)
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Shutdown")
+```
