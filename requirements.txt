@@ -1,9 +1,9 @@
 aiogram==3.13.1
-asyncpg
 aiohttp
+asyncpg
 beautifulsoup4
 google-genai
-python-dotenv
-pytz
-requests
 pgvector
+pillow
+python-dotenv
+requests
