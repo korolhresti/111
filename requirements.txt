@@ -1,9 +1,17 @@
+python-telegram-bot[job-queue]==20.8
 aiogram==3.13.1
-aiohttp
 asyncpg
+aiohttp
 beautifulsoup4
+requests
 google-genai
-pgvector
 pillow
 python-dotenv
-requests
+pytz
+lxml
+numpy
+scikit-learn
+# Бібліотеки для локального AI (Computer Vision)
+torch --extra-index-url https://download.pytorch.org/whl/cpu
+transformers
+sentence-transformers
