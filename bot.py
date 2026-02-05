@@ -17,14 +17,13 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 # --- Telegram Imports ---
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     ContextTypes,
     ConversationHandler,
-    CallbackQueryHandler,
     filters,
 )
 
@@ -43,22 +42,22 @@ load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAMTOKEN", "")
 DB_DSN = os.getenv("DATABASEURL", "postgresql://user:password@host/dbname")
 GEMINI_KEY = os.getenv("GEMINIAPIKEY", "")
-CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "")  # ID каналу для Super Deals
+CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "")  # ID каналу
 ADMIN_IDS = [int(x) for x in os.getenv("ADMINUSERID", "0").split(",") if x.strip().isdigit()]
 
 # --- Ініціалізація Gemini ---
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
-    ai_model = genai.GenerativeModel('gemini-1.5-flash') # Використовуємо Flash для швидкості
+    ai_model = genai.GenerativeModel('gemini-1.5-flash')
 else:
     ai_model = None
     log.error("Gemini API Key missing!")
 
-# --- Глобальні змінні для ML моделі (завантажуються при старті) ---
+# --- Глобальні змінні для ML моделі ---
 img_model = None  # Тут буде CLIP модель
 
 # --- СТАНИ ДІАЛОГУ ---
-MENU, PHOTO_ANALYSIS, SEARCH_CONFIRM = range(3)
+MENU = range(1)
 
 # --- КЛАВІАТУРА ---
 KB_MAIN = ReplyKeyboardMarkup(
@@ -74,16 +73,12 @@ KB_MAIN = ReplyKeyboardMarkup(
 # ==============================================================================
 
 class LocalVisionSearch:
-    """Клас для локального порівняння зображень через вектори (Embeddings)."""
-    
     def __init__(self):
         self.model = None
         
     def load_model(self):
-        """Завантажує CLIP модель. Це може зайняти час і пам'ять."""
         if self.model is None:
             log.info("Завантаження локальної ML моделі (CLIP)...")
-            # Використовуємо легку модель clip-ViT-B-32
             try:
                 self.model = SentenceTransformer('clip-ViT-B-32')
                 log.info("ML модель завантажено успішно.")
@@ -91,7 +86,6 @@ class LocalVisionSearch:
                 log.error(f"Помилка завантаження ML моделі: {e}")
 
     def get_embedding(self, image: Image.Image) -> Optional[np.ndarray]:
-        """Генерує вектор для зображення."""
         if not self.model:
             self.load_model()
         try:
@@ -101,7 +95,6 @@ class LocalVisionSearch:
             return None
 
     def calculate_similarity(self, emb1: np.ndarray, emb2: np.ndarray) -> float:
-        """Обчислює косинусну схожість (0..1)."""
         return float(util.cos_sim(emb1, emb2)[0][0])
 
 vision_engine = LocalVisionSearch()
@@ -121,7 +114,6 @@ class Database:
 
     async def create_tables(self):
         async with self.pool.acquire() as conn:
-            # Таблиця еталонних годинників (Empress)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS empress_watches (
                     id SERIAL PRIMARY KEY,
@@ -130,11 +122,10 @@ class Database:
                     url TEXT,
                     collection TEXT,
                     image_url TEXT,
-                    embedding FLOAT[],  -- Вектор зображення
+                    embedding FLOAT[],
                     updated_at TIMESTAMP DEFAULT NOW()
                 )
             """)
-            # Таблиця знайдених угод (OLX та інші)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS deals (
                     id SERIAL PRIMARY KEY,
@@ -148,7 +139,6 @@ class Database:
             """)
 
     async def save_empress_watch(self, data: Dict):
-        """Зберігає або оновлює годинник в базі."""
         async with self.pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO empress_watches (title, price_usd, url, collection, image_url, embedding)
@@ -158,9 +148,6 @@ class Database:
             """, data['title'], data['price'], data['url'], data['collection'], data['image_url'], data['embedding'])
 
     async def find_closest_match(self, query_embedding: List[float], limit=3):
-        """Знаходить найбільш схожий годинник в базі за вектором (Cosine Similarity)."""
-        # Примітка: Для реального High-load краще використовувати pgvector. 
-        # Тут робимо просту вибірку і сортування в Python, якщо записів < 10000 це ОК.
         async with self.pool.acquire() as conn:
             rows = await conn.fetch("SELECT title, price_usd, url, image_url, embedding FROM empress_watches")
             
@@ -173,7 +160,6 @@ class Database:
                 sim = vision_engine.calculate_similarity(q_vec, db_vec)
                 results.append({**dict(row), 'similarity': sim})
         
-        # Сортуємо за схожістю
         results.sort(key=lambda x: x['similarity'], reverse=True)
         return results[:limit]
 
@@ -185,20 +171,18 @@ class EmpressScraper:
     BASE_URL = "https://empress.cc"
     
     async def scrape_collection(self, collection_url: str, db: Database):
-        """Парсить колекцію, качає фото, робить вектори, зберігає в БД."""
         log.info(f"Початок парсингу Empress: {collection_url}")
         async with aiohttp.ClientSession() as session:
             try:
                 async with session.get(collection_url) as resp:
-                    if resp.status != 200:
-                        return 0
+                    if resp.status != 200: return 0
                     html = await resp.text()
             except Exception as e:
                 log.error(f"Помилка доступу до {collection_url}: {e}")
                 return 0
 
             soup = BeautifulSoup(html, 'lxml')
-            products = soup.select('.grid-product__content') # Селектор може відрізнятися, треба перевіряти актуальний сайт
+            products = soup.select('.grid-product__content')
             
             count = 0
             for prod in products:
@@ -208,21 +192,16 @@ class EmpressScraper:
                     img_elem = prod.select_one('img')
                     link_elem = prod.select_one('.grid-product__link')
 
-                    if not (title_elem and price_elem and img_elem):
-                        continue
+                    if not (title_elem and price_elem and img_elem): continue
 
                     title = title_elem.get_text(strip=True)
                     price_str = price_elem.get_text(strip=True).replace('$', '').replace(',', '')
-                    # Проста чистка ціни (беремо першу знайдену цифру якщо там діапазон)
                     price = float(re.findall(r"[\d\.]+", price_str)[0])
                     
                     img_url = "https:" + img_elem['src'] if img_elem['src'].startswith('//') else img_elem['src']
-                    # Видаляємо параметри розміру (наприклад _300x300) щоб взяти фул
                     img_url = re.sub(r'_\d+x\d+', '', img_url) 
-                    
                     prod_url = self.BASE_URL + link_elem['href']
 
-                    # Завантаження фото для вектора
                     embedding_list = []
                     try:
                         async with session.get(img_url) as img_resp:
@@ -246,25 +225,14 @@ class EmpressScraper:
                             'embedding': embedding_list
                         })
                         count += 1
-                        log.info(f"Збережено: {title} - ${price}")
                 except Exception as e:
                     log.error(f"Помилка парсингу товару: {e}")
-            
             return count
 
 class OLXHunter:
-    """Модуль для пошуку на OLX за ключовими словами та візуальної звірки."""
-    
     async def search_and_verify(self, query: str, reference_embedding: List[float], min_price: float, max_price: float):
-        """
-        1. Шукає текст на OLX.
-        2. Качає фото результатів.
-        3. Порівнює вектори локально.
-        4. Повертає збіги.
-        """
         search_url = f"https://www.olx.ua/uk/list/q-{query.replace(' ', '-')}/"
         results = []
-        
         log.info(f"OLX Пошук: {query}")
         
         async with aiohttp.ClientSession() as session:
@@ -276,9 +244,9 @@ class OLXHunter:
                 return []
 
             soup = BeautifulSoup(html, 'lxml')
-            offers = soup.select('[data-cy="l-card"]') # Актуальний селектор OLX
+            offers = soup.select('[data-cy="l-card"]')
             
-            for offer in offers[:10]: # Перевіряємо топ-10 результатів
+            for offer in offers[:10]:
                 try:
                     title_div = offer.select_one('h6')
                     if not title_div: continue
@@ -291,22 +259,17 @@ class OLXHunter:
                     if not price_div: continue
                     price_raw = price_div.get_text(strip=True).replace(' ', '').replace('грн.', '')
                     
-                    # Конвертація гривні в долар (приблизно)
                     try:
                         price_uah = float(re.findall(r'\d+', price_raw)[0])
-                        price_usd = price_uah / 41.5 # Курс заглушка
-                    except:
-                        continue
+                        price_usd = price_uah / 41.5
+                    except: continue
 
-                    if not (min_price * 0.2 <= price_usd <= max_price * 1.5):
-                        continue # Відсікаємо сміття
+                    if not (min_price * 0.2 <= price_usd <= max_price * 1.5): continue
 
-                    # Отримуємо фото прев'ю
                     img_tag = offer.select_one('img')
                     if not img_tag: continue
                     img_src = img_tag.get('src')
                     
-                    # Візуальна звірка
                     similarity = 0.0
                     if img_src and reference_embedding:
                         async with session.get(img_src) as i_resp:
@@ -317,7 +280,7 @@ class OLXHunter:
                                 if olx_emb is not None:
                                     similarity = vision_engine.calculate_similarity(np.array(reference_embedding), olx_emb)
 
-                    if similarity > 0.75: # Поріг схожості
+                    if similarity > 0.75:
                         results.append({
                             'title': title,
                             'price_usd': price_usd,
@@ -325,10 +288,8 @@ class OLXHunter:
                             'similarity': similarity,
                             'img_src': img_src
                         })
-
                 except Exception as e:
                     log.error(f"Помилка обробки лота OLX: {e}")
-                    
         return results
 
 # ==============================================================================
@@ -352,24 +313,20 @@ class WatchBot:
         return MENU
 
     async def handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Основна функція обробки фото користувача."""
         user = update.message.from_user
         log.info(f"Отримано фото від {user.first_name}")
 
         status_msg = await update.message.reply_text("🧠 AI аналізує зображення...")
         
-        # 1. Завантаження фото
         photo_file = await update.message.photo[-1].get_file()
         img_bytes = await photo_file.download_as_bytearray()
         user_image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
 
-        # 2. Генерація вектора (Local Vision)
         user_embedding = vision_engine.get_embedding(user_image)
         if user_embedding is None:
             await status_msg.edit_text("❌ Помилка обробки зображення (Vision AI).")
             return MENU
 
-        # 3. Пошук схожого в базі Empress (Local Search)
         await status_msg.edit_text("🔍 Порівнюю з еталонною базою Empress...")
         matches = await self.db.find_closest_match(user_embedding.tolist(), limit=1)
         
@@ -379,7 +336,7 @@ class WatchBot:
         
         if matches:
             top_match = matches[0]
-            if top_match['similarity'] > 0.8: # Поріг впевненості
+            if top_match['similarity'] > 0.8:
                 ref_price = float(top_match['price_usd'])
                 ref_title = top_match['title']
                 reference_info = (
@@ -391,7 +348,6 @@ class WatchBot:
             else:
                 reference_info = f"⚠️ Прямої відповідності в Empress не знайдено (найближче: {top_match['similarity']*100:.1f}%)."
 
-        # 4. AI Аналіз (Gemini) для деталей
         await status_msg.edit_text("📝 Генерую експертний звіт...")
         
         prompt = """
@@ -417,7 +373,6 @@ class WatchBot:
             log.error(f"Gemini Error: {e}")
             analysis = {"brand": "Unknown", "search_keywords": "годинник"}
 
-        # 5. Пошук на OLX (якщо є ключові слова)
         olx_deals = []
         if analysis.get('search_keywords'):
             await status_msg.edit_text(f"🦅 Шукаю лоти на OLX за запитом: '{analysis['search_keywords']}'...")
@@ -428,7 +383,6 @@ class WatchBot:
                 max_price=ref_price * 1.2 if ref_price else 10000
             )
 
-        # 6. Формування звіту
         report = (
             f"🕵️‍♂️ **ЗВІТ AI-ЕКСПЕРТА**\n\n"
             f"🏷 **Бренд:** {analysis.get('brand')}\n"
@@ -439,26 +393,21 @@ class WatchBot:
             f"🏛 **Еталон (Empress):**\n{reference_info}\n"
         )
 
-        buttons = []
         if olx_deals:
             report += "\n🇺🇦 **Знайдено на OLX (схожі візуально):**\n"
             for deal in olx_deals:
                 profit_icon = "🔥 SUPER DEAL" if (ref_price > 0 and deal['price_usd'] < ref_price * 0.6) else ""
                 report += f"- [{deal['title']}]({deal['url']}) - **${deal['price_usd']:.0f}** {profit_icon}\n"
                 
-                # Якщо це супер-угода і є канал - постимо
                 if profit_icon and CHANNEL_ID:
-                    await self.post_to_channel(context, deal, ref_price, analysis['brand'], user_image)
+                    await self.post_to_channel(context, deal, ref_price, analysis['brand'])
         else:
             report += "\n😞 На OLX ідентичних лотів візуально не підтверджено."
 
-        # Відправка фінального повідомлення
-        # Зберігаємо картинку для відправки назад якщо треба, але тут просто текст
         await update.message.reply_text(report, parse_mode="Markdown", disable_web_page_preview=True)
         return MENU
 
-    async def post_to_channel(self, context, deal, ref_price, brand, img_obj):
-        """Автопостинг супер-угод."""
+    async def post_to_channel(self, context, deal, ref_price, brand):
         percent_off = ((ref_price - deal['price_usd']) / ref_price) * 100
         text = (
             f"🚨 **SUPER DEAL DETECTED!**\n\n"
@@ -469,30 +418,23 @@ class WatchBot:
             f"👉 [Переглянути оголошення]({deal['url']})"
         )
         try:
-            # Для простоти не відправляємо картинку в канал в цьому коді, 
-            # бо треба зберігати її локально, але можна додати send_photo
             await context.bot.send_message(chat_id=CHANNEL_ID, text=text, parse_mode="Markdown")
         except Exception as e:
             log.error(f"Помилка посту в канал: {e}")
 
     async def update_empress_db(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Запускає парсинг Empress."""
         if update.message.from_user.id not in ADMIN_IDS:
             await update.message.reply_text("Тільки для адмінів.")
             return MENU
             
         await update.message.reply_text("🔄 Починаю оновлення бази Empress... Це може зайняти хвилини.")
-        
-        # Приклад однієї колекції (можна розширити список)
         url = "https://empress.cc/collections/swiss-vintage-watches"
         count = await self.empress.scrape_collection(url, self.db)
-        
         await update.message.reply_text(f"✅ Оновлення завершено. Додано/Оновлено годинників: {count}")
         return MENU
 
     async def status_check(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
-            # Перевірка підключення до БД
             async with self.db.pool.acquire() as conn:
                 count = await conn.fetchval("SELECT COUNT(*) FROM empress_watches")
             
@@ -504,22 +446,45 @@ class WatchBot:
             )
         except Exception as e:
             msg = f"Помилка отримання статусу: {e}"
-            
         await update.message.reply_text(msg)
         return MENU
+
+# --- ФУНКЦІЯ ПОВІДОМЛЕННЯ ПРИ ЗАПУСКУ ---
+async def post_init(application: Application):
+    """Виконується після успішного запуску бота."""
+    log.info("Бот запущено. Відправка повідомлення в канал...")
+    
+    welcome_message = (
+        "🚀 **Watch-Expert AI Pro v1 ЗАПУЩЕНО!**\n\n"
+        "Система готова до роботи. Доступні команди:\n"
+        "📸 **Оцінити годинник** - Надішліть фото боту\n"
+        "🔍 **Пошук SUPER DEAL** - Автоматичний аналіз при оцінці\n"
+        "🔄 **Оновити базу Empress** - (Адмін) Парсинг еталонів\n"
+        "⚙️ **Статус системи** - Перевірка підключень\n\n"
+        "🤖 Бот очікує фотографії..."
+    )
+    
+    if CHANNEL_ID:
+        try:
+            await application.bot.send_message(chat_id=CHANNEL_ID, text=welcome_message, parse_mode="Markdown")
+            log.info("Вітання відправлено в канал.")
+        except Exception as e:
+            log.error(f"Не вдалося відправити вітання в канал: {e}")
+    else:
+        log.warning("CHANNEL_ID не встановлено, вітання не відправлено.")
 
 # --- MAIN SETUP ---
 
 async def main():
-    # 1. Ініціалізація БД
     bot_instance = WatchBot()
     await bot_instance.db.connect()
     
-    # 2. Попереднє завантаження ML (можна у фоні, але краще дочекатися)
-    vision_engine.load_model()
+    # Спроба завантажити ML модель при старті (блокуюче)
+    # Якщо мало RAM, це може вбити процес. Можна закоментувати.
+    # vision_engine.load_model()
     
-    # 3. Setup Telegram App
-    application = Application.builder().token(BOT_TOKEN).build()
+    # Додаємо post_init для відправки повідомлення при старті
+    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", bot_instance.start)],
@@ -537,8 +502,7 @@ async def main():
 
     application.add_handler(conv_handler)
     
-    # Запуск
-    log.info("Бот запущено!")
+    log.info("Початок поллінгу...")
     await application.run_polling()
 
 if __name__ == "__main__":
