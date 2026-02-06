@@ -21,9 +21,17 @@ from telegram.ext import (
 )
 
 # --- ⚙️ КОНФІГУРАЦІЯ ---
-TOKEN = "8509179556:AAFWu5bGnGDNShzmynZE2fHZKYo3BYmKhqE"
-ADMIN_ID = 8184456641
-CHANNEL_ID = -1003680291028
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8509179556:AAFWu5bGnGDNShzmynZE2fHZKYo3BYmKhqE")
+# Перетворюємо ADMIN_ID в число, якщо можливо, інакше використовуємо дефолтне
+try:
+    ADMIN_ID = int(os.getenv("ADMIN_CHAT_ID", "8184456641"))
+except ValueError:
+    ADMIN_ID = 8184456641
+    
+try:
+    CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003680291028"))
+except ValueError:
+    CHANNEL_ID = -1003680291028
 
 # Файли сховища (замість Бази Даних)
 SOURCES_FILE = "sources.json"   # Тут зберігаємо еталони (Empress, Violity)
@@ -40,20 +48,26 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 class JsonDB:
     @staticmethod
-    def load(filename, default=[]):
+    def load(filename, default=None):
+        if default is None:
+            default = []
         if not os.path.exists(filename):
             JsonDB.save(filename, default)
             return default
         try:
             with open(filename, 'r', encoding='utf-8') as f:
                 return json.load(f)
-        except:
+        except (json.JSONDecodeError, IOError) as e:
+            logger.error(f"Error loading {filename}: {e}. Returning default.")
             return default
 
     @staticmethod
     def save(filename, data):
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+        except IOError as e:
+            logger.error(f"Error saving {filename}: {e}")
 
 # --- 👁 КОМП'ЮТЕРНИЙ ЗІР (OpenCV) ---
 
@@ -65,10 +79,14 @@ class VisualEye:
 
     def download_image(self, url):
         """Завантажує зображення в пам'ять для OpenCV"""
+        if not url:
+            return None
         try:
             headers = {'User-Agent': UserAgent().random}
-            resp = requests.get(url, headers=headers, timeout=10)
-            if resp.status_code != 200: return None
+            resp = requests.get(url, headers=headers, timeout=15)
+            if resp.status_code != 200: 
+                logger.warning(f"Failed to download image {url}, status: {resp.status_code}")
+                return None
             
             image_array = np.asarray(bytearray(resp.content), dtype=np.uint8)
             img = cv2.imdecode(image_array, cv2.IMREAD_GRAYSCALE) # Ч/Б для аналізу
@@ -85,29 +103,36 @@ class VisualEye:
         if reference_img is None or scene_img is None:
             return 0
 
-        # Знаходимо ключові точки
-        kp1, des1 = self.orb.detectAndCompute(reference_img, None)
-        kp2, des2 = self.orb.detectAndCompute(scene_img, None)
+        try:
+            # Знаходимо ключові точки
+            kp1, des1 = self.orb.detectAndCompute(reference_img, None)
+            kp2, des2 = self.orb.detectAndCompute(scene_img, None)
 
-        if des1 is None or des2 is None:
+            if des1 is None or des2 is None:
+                return 0
+
+            if len(des1) < 2 or len(des2) < 2:
+                return 0
+
+            # Співставлення
+            matches = self.bf.match(des1, des2)
+            # Сортуємо: найкращі матчі перші
+            matches = sorted(matches, key=lambda x: x.distance)
+
+            # Беремо топ-20 точок
+            good_matches = [m for m in matches if m.distance < 50]
+            
+            # Евристика: якщо знайдено багато співпадаючих точок, об'єкт присутній
+            score = len(good_matches)
+            
+            # Нормалізація (0-100%) - дуже приблизно
+            # max_possible = len(kp1) if len(kp1) > 0 else 1
+            confidence = min(100, (score / 15) * 100) # 15 точок вважаємо гарним збігом
+            
+            return confidence
+        except Exception as e:
+            logger.error(f"Error in find_object_in_scene: {e}")
             return 0
-
-        # Співставлення
-        matches = self.bf.match(des1, des2)
-        # Сортуємо: найкращі матчі перші
-        matches = sorted(matches, key=lambda x: x.distance)
-
-        # Беремо топ-20 точок
-        good_matches = [m for m in matches if m.distance < 50]
-        
-        # Евристика: якщо знайдено багато співпадаючих точок, об'єкт присутній
-        score = len(good_matches)
-        
-        # Нормалізація (0-100%) - дуже приблизно
-        max_possible = len(kp1) if len(kp1) > 0 else 1
-        confidence = min(100, (score / 15) * 100) # 15 точок вважаємо гарним збігом
-        
-        return confidence
 
 vision = VisualEye()
 
@@ -118,7 +143,11 @@ class Scraper:
         self.ua = UserAgent()
 
     def get_headers(self):
-        return {'User-Agent': self.ua.random}
+        return {
+            'User-Agent': self.ua.random,
+            'Accept-Language': 'uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+        }
 
     def detect_replica(self, text):
         """Перевіряє текст на ознаки підробки"""
@@ -143,28 +172,43 @@ class Scraper:
         if img:
             img_tag = img.find('img')
             if img_tag:
-                img_url = "https:" + img_tag['src'] if img_tag['src'].startswith('//') else img_tag['src']
+                src = img_tag.get('src') or img_tag.get('data-src')
+                if src:
+                    img_url = "https:" + src if src.startswith('//') else src
         
         return {"title": title, "price": price, "image_url": img_url, "url": url, "source": "Empress.cc"}
 
     def parse_generic(self, url):
         """Універсальний парсер (Violity та інші)"""
         try:
-            resp = requests.get(url, headers=self.get_headers(), timeout=10)
+            resp = requests.get(url, headers=self.get_headers(), timeout=15)
+            if resp.status_code != 200:
+                logger.error(f"Failed to fetch {url}, status code: {resp.status_code}")
+                return None
+                
             soup = BeautifulSoup(resp.text, 'lxml')
             
             if "empress.cc" in url:
                 return self.parse_empress_cc(url, soup)
 
             # Спроба витягнути OpenGraph теги (працює для Violity, OLX, eBay)
-            title = soup.find("meta", property="og:title")
-            title = title["content"] if title else soup.title.string
+            title_meta = soup.find("meta", property="og:title")
+            title = title_meta["content"] if title_meta else (soup.title.string if soup.title else "Unknown Item")
             
-            image = soup.find("meta", property="og:image")
-            image_url = image["content"] if image else None
+            image_meta = soup.find("meta", property="og:image")
+            image_url = image_meta["content"] if image_meta else None
             
+            # Якщо OG image немає, шукаємо першу велику картинку
+            if not image_url:
+                 images = soup.find_all('img')
+                 for img in images:
+                     src = img.get('src')
+                     if src and ('jpg' in src or 'png' in src) and len(src) > 50:
+                         image_url = src if src.startswith('http') else url + src # simplistic relative url handling
+                         break
+
             return {
-                "title": title, 
+                "title": title.strip(), 
                 "price": "Аукціон/Невідомо", 
                 "image_url": image_url, 
                 "url": url,
@@ -176,23 +220,41 @@ class Scraper:
 
     def search_olx(self, query):
         """Пошук на OLX"""
-        clean_query = re.sub(r'[^\w\s]', '', query) # Видаляємо спецсимволи
+        if not query:
+            return []
+            
+        # Прибираємо зайві символи, залишаємо букви і цифри
+        clean_query = re.sub(r'[^\w\s]', '', query).strip()
         search_url = f"https://www.olx.ua/uk/list/q-{clean_query.replace(' ', '-')}/"
         
         results = []
         try:
-            resp = requests.get(search_url, headers=self.get_headers(), timeout=10)
+            resp = requests.get(search_url, headers=self.get_headers(), timeout=15)
+            if resp.status_code != 200:
+                logger.warning(f"OLX search failed for '{query}', status: {resp.status_code}")
+                return []
+                
             soup = BeautifulSoup(resp.text, 'lxml')
             
             # Селектор OLX (може змінюватись, data-cy надійний)
             cards = soup.find_all('div', {'data-cy': 'l-card'})
             
+            if not cards:
+                # Fallback search if class names changed
+                cards = soup.find_all('div', class_=lambda x: x and 'css-' in x) # Generic css class catch might be noisy
+            
             for card in cards[:8]: # Перші 8 результатів
                 try:
                     link = card.find('a', href=True)
+                    if not link: continue
+                    
                     url = link['href']
                     if not url.startswith('http'): url = "https://www.olx.ua" + url
                     
+                    # Пропускаємо рекламні оголошення (зазвичай мають promo в url або інші класи)
+                    if 'promoted' in str(card).lower():
+                        continue
+
                     title_tag = card.find('h6')
                     title = title_tag.text.strip() if title_tag else "No Title"
                     
@@ -200,7 +262,11 @@ class Scraper:
                     price = price_tag.text.strip() if price_tag else "?"
                     
                     img_tag = card.find('img')
-                    img_url = img_tag['src'] if img_tag else None
+                    img_url = img_tag.get('src') if img_tag else None
+                    
+                    # Іноді src пустий, є data-src або srcset
+                    if not img_url and img_tag:
+                         img_url = img_tag.get('data-src')
 
                     status = self.detect_replica(title)
 
@@ -212,7 +278,9 @@ class Scraper:
                             "image_url": img_url,
                             "status": status
                         })
-                except: continue
+                except Exception as e: 
+                    logger.debug(f"Error parsing card: {e}")
+                    continue
         except Exception as e:
             logger.error(f"OLX Search Failed: {e}")
             
@@ -223,7 +291,11 @@ scraper = Scraper()
 # --- 🤖 ЛОГІКА БОТА ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID: 
+        await update.message.reply_text("⛔ Доступ заборонено.")
+        return
+        
     await update.message.reply_text(
         "🖥 **Панель керування колекціонера**\n\n"
         "Цей бот автоматично моніторить OLX на основі ваших зразків.\n"
@@ -248,7 +320,7 @@ async def add_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = await asyncio.to_thread(scraper.parse_generic, url)
     
     if not data or not data['image_url']:
-        await msg.edit_text("❌ Не вдалося отримати фото або дані. Спробуйте інше посилання.")
+        await msg.edit_text("❌ Не вдалося отримати фото або дані. Спробуйте інше посилання або перевірте доступність сайту.")
         return
 
     # 2. Збереження
@@ -276,6 +348,7 @@ async def add_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_photo(chat_id=CHANNEL_ID, photo=data['image_url'], caption=caption, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logger.error(f"Channel post error: {e}")
+        await msg.reply_text(f"⚠️ Помилка посту в канал: {e}. Перевірте права адміністратора для бота в каналі.")
 
 async def list_sources(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
@@ -331,7 +404,7 @@ async def background_search(context: ContextTypes.DEFAULT_TYPE):
             confidence = await asyncio.to_thread(vision.find_object_in_scene, ref_img, scene_img)
 
             # Логіка рішення:
-            # Якщо confidence > 20% (орієнтовно), або якщо назва дуже схожа
+            # Якщо confidence > 15% (орієнтовно), або якщо назва дуже схожа (можна додати перевірку)
             is_visual_match = confidence > 15 
             
             if is_visual_match:
@@ -390,20 +463,23 @@ async def post_init(application: Application):
         logger.error(f"Failed to send welcome: {e}")
 
 def main():
-    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    # Будуємо Application з усіма параметрами
+    application = Application.builder().token(TOKEN).post_init(post_init).build()
 
     # Хендлери команд
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("add", add_source))
-    app.add_handler(CommandHandler("list", list_sources))
-    app.add_handler(CommandHandler("clear", clear_sources))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("add", add_source))
+    application.add_handler(CommandHandler("list", list_sources))
+    application.add_handler(CommandHandler("clear", clear_sources))
 
     # Фонові задачі (кожні 5 хвилин = 300 сек)
-    if app.job_queue:
-        app.job_queue.run_repeating(background_search, interval=300, first=10)
+    if application.job_queue:
+        application.job_queue.run_repeating(background_search, interval=300, first=10)
 
     print("Bot is running...")
-    app.run_polling()
+    
+    # Запуск polling
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
