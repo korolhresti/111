@@ -2,309 +2,375 @@ import logging
 import json
 import os
 import asyncio
+import re
+import sys
+import time
+import random
+from datetime import datetime
+from io import BytesIO
+
+# Сторонні бібліотеки
 import requests
 import cv2
 import numpy as np
-import re
-import html
-import traceback
-from io import BytesIO
+from aiohttp import web
 from fake_useragent import UserAgent
 from bs4 import BeautifulSoup
-from aiohttp import web
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    ApplicationBuilder,
     CommandHandler,
     ContextTypes,
     MessageHandler,
-    filters,
     CallbackQueryHandler,
-    ApplicationBuilder
+    filters,
 )
 
-# --- ⚙️ КОНФІГУРАЦІЯ ---
+# --- ⚙️ КОНФІГУРАЦІЯ ТА ЗМІННІ СЕРЕДОВИЩА ---
+# Використовуємо змінні середовища або дефолтні значення з вашого ТЗ
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8509179556:AAFWu5bGnGDNShzmynZE2fHZKYo3BYmKhqE")
-try:
-    ADMIN_ID = int(os.getenv("ADMIN_CHAT_ID", "8184456641"))
-    CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003680291028"))
-    PORT = int(os.getenv("PORT", 8080))
-except ValueError:
-    print("❌ Помилка: Перевірте ID чатів та порту в змінних середовища.")
-    exit(1)
 
-SOURCES_FILE = "sources.json"
-HISTORY_FILE = "history.json"
-DB_IMAGES_DIR = "db_images"
+def get_env_int(key, default):
+    try:
+        val = os.getenv(key, str(default))
+        return int(val)
+    except ValueError:
+        return int(default)
+
+ADMIN_ID = get_env_int("ADMIN_CHAT_ID", 8184456641)
+CHANNEL_ID = get_env_int("CHANNEL_ID", -1003680291028)
+PORT = get_env_int("PORT", 8080)
+
+# Шляхи до файлів
+DATA_DIR = "data"
+IMAGES_DIR = os.path.join(DATA_DIR, "images")
+SOURCES_FILE = os.path.join(DATA_DIR, "sources.json")
+HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
+
+# Створення папок
+os.makedirs(IMAGES_DIR, exist_ok=True)
 
 # Налаштування логування
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", 
-    level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
-# Прибираємо шум від бібліотек
+# Прибираємо зайвий шум від бібліотек
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
-logger = logging.getLogger("ExpertBot")
+logger = logging.getLogger("CollectorPro")
 
-# --- 💾 РОБОТА З ДАНИМИ ---
-class JsonDB:
-    """Клас для безпечної роботи з JSON (потокобезпечний)"""
+# --- 💾 МОДУЛЬ БАЗИ ДАНИХ (JSON) ---
+class JsonDatabase:
+    """Клас для надійного збереження даних у JSON файли"""
     _lock = asyncio.Lock()
 
     @staticmethod
-    async def load(filename, default=None):
-        if default is None: default = []
-        async with JsonDB._lock:
-            if not os.path.exists(filename):
-                return default
+    async def load(filepath, default_factory=list):
+        async with JsonDatabase._lock:
+            if not os.path.exists(filepath):
+                return default_factory()
             try:
-                with open(filename, 'r', encoding='utf-8') as f:
+                with open(filepath, 'r', encoding='utf-8') as f:
                     return json.load(f)
             except Exception as e:
-                logger.error(f"DB Load Error {filename}: {e}")
-                return default
+                logger.error(f"DB Load Error ({filepath}): {e}")
+                return default_factory()
 
     @staticmethod
-    async def save(filename, data):
-        async with JsonDB._lock:
+    async def save(filepath, data):
+        async with JsonDatabase._lock:
             try:
-                # Запис у тимчасовий файл для запобігання пошкодженню
-                temp_file = filename + ".tmp"
-                with open(temp_file, 'w', encoding='utf-8') as f:
+                # Атомарний запис через тимчасовий файл
+                temp_path = filepath + ".tmp"
+                with open(temp_path, 'w', encoding='utf-8') as f:
                     json.dump(data, f, indent=4, ensure_ascii=False)
-                os.replace(temp_file, filename)
+                os.replace(temp_path, filepath)
             except Exception as e:
-                logger.error(f"DB Save Error {filename}: {e}")
+                logger.error(f"DB Save Error ({filepath}): {e}")
 
-# --- 👁 КОМП'ЮТЕРНИЙ ЗІР (OpenCV) ---
-class VisionEngine:
+# --- 👁 МОДУЛЬ КОМП'ЮТЕРНОГО ЗОРУ (OpenCV) ---
+class ComputerVision:
     def __init__(self):
-        # ORB - оптимальний баланс швидкості та точності
-        self.orb = cv2.ORB_create(nfeatures=1500)
+        # ORB детектор для пошуку ключових точок
+        self.orb = cv2.ORB_create(nfeatures=2000)
+        # BFMatcher для порівняння точок
         self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
 
-    def get_image_from_source(self, source):
-        """Завантажує фото з URL або локального файлу"""
+    def load_image_from_bytes(self, image_bytes):
+        """Конвертує байти в зображення OpenCV"""
         try:
-            content = None
-            if source.startswith(('http://', 'https://')):
-                headers = {'User-Agent': UserAgent().random}
-                resp = requests.get(source, timeout=10, headers=headers)
-                if resp.status_code == 200:
-                    content = resp.content
-            elif os.path.exists(source):
-                with open(source, 'rb') as f:
-                    content = f.read()
-            
-            if content:
-                arr = np.asarray(bytearray(content), dtype=np.uint8)
-                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                return img
+            nparr = np.frombuffer(image_bytes, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            return img
         except Exception as e:
-            logger.error(f"Image load error ({source}): {e}")
-        return None
+            logger.error(f"CV Decode Error: {e}")
+            return None
 
-    def compare_images(self, img1, img2):
-        """Повертає відсоток схожості (0-100)"""
+    def compare(self, img1, img2):
+        """
+        Порівнює два зображення.
+        Повертає оцінку схожості від 0 до 100.
+        Використовує комбінацію співставлення точок (Geometry) та гістограм (Color).
+        """
         if img1 is None or img2 is None: return 0
-        
+
         try:
-            # 1. ORB (Геометрія)
+            # 1. Геометричний аналіз (ORB)
             gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR_GRAY)
             gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR_GRAY)
-            
+
             kp1, des1 = self.orb.detectAndCompute(gray1, None)
             kp2, des2 = self.orb.detectAndCompute(gray2, None)
 
-            if des1 is None or des2 is None or len(des1) < 5 or len(des2) < 5:
-                return 0
+            geo_score = 0
+            if des1 is not None and des2 is not None and len(des1) > 0 and len(des2) > 0:
+                matches = self.bf.match(des1, des2)
+                # Сортуємо за дистанцією (менше = краще)
+                matches = sorted(matches, key=lambda x: x.distance)
+                # Беремо лише хороші збіги (дистанція < 50)
+                good_matches = [m for m in matches if m.distance < 60]
+                
+                # Евристика: 30 гарних точок - це дуже схоже
+                geo_score = min(100, (len(good_matches) / 25) * 100)
 
-            matches = self.bf.match(des1, des2)
-            # Фільтруємо найкращі збіги (дистанція < 50)
-            good_matches = [m for m in matches if m.distance < 50]
+            # 2. Колірний аналіз (Histogram)
+            # Допомагає відсіяти предмети однакової форми, але різного кольору
+            h_bins = 50
+            s_bins = 60
+            histSize = [h_bins, s_bins]
+            h_ranges = [0, 180]
+            s_ranges = [0, 256]
+            ranges = h_ranges + s_ranges
+            channels = [0, 1]
+
+            hsv_base = cv2.cvtColor(img1, cv2.COLOR_BGR2HSV)
+            hsv_test = cv2.cvtColor(img2, cv2.COLOR_BGR2HSV)
+
+            hist_base = cv2.calcHist([hsv_base], channels, None, histSize, ranges, accumulate=False)
+            cv2.normalize(hist_base, hist_base, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+
+            hist_test = cv2.calcHist([hsv_test], channels, None, histSize, ranges, accumulate=False)
+            cv2.normalize(hist_test, hist_test, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+
+            # Метод кореляції (1.0 = ідеально)
+            color_score = cv2.compareHist(hist_base, hist_test, cv2.HISTCMP_CORREL) * 100
+            color_score = max(0, color_score)
+
+            # Фінальна оцінка: 70% геометрія, 30% колір
+            final_score = (geo_score * 0.7) + (color_score * 0.3)
             
-            # Нормалізація результату
-            match_score = len(good_matches)
-            # Евристика: 20 гарних точок - це вже дуже схоже
-            score_geo = min(100, (match_score / 20) * 100)
+            return final_score
 
-            return score_geo
         except Exception as e:
-            logger.error(f"CV Error: {e}")
+            logger.error(f"CV Comparison Error: {e}")
             return 0
 
-vision = VisionEngine()
+cv_engine = ComputerVision()
 
-# --- 🕸 ПАРСЕР ---
-class Scraper:
+# --- 🕸 МОДУЛЬ СКРЕЙПІНГУ ---
+class ScraperEngine:
     def __init__(self):
         self.ua = UserAgent()
 
-    def _headers(self):
+    def get_headers(self):
         return {
             'User-Agent': self.ua.random,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
             'Accept-Language': 'uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+            'Referer': 'https://www.google.com/'
         }
 
-    def sync_empress(self):
-        """Парсинг Empress.cc"""
-        url = "https://empress.cc/collections/all"
-        products = []
+    def download_image_bytes(self, url):
+        """Завантажує байти зображення з URL"""
+        if not url: return None
         try:
-            logger.info("Starting Empress sync...")
-            res = requests.get(url, headers=self._headers(), timeout=20)
-            soup = BeautifulSoup(res.text, 'lxml')
+            # Обробка локальних файлів
+            if not url.startswith('http'):
+                with open(url, 'rb') as f:
+                    return f.read()
             
-            # Пошук товарів на сторінці колекції
-            items = soup.select('.grid-product__content, .product-card')
+            # Обробка веб-URL
+            resp = requests.get(url, headers=self.get_headers(), timeout=15)
+            if resp.status_code == 200:
+                return resp.content
+        except Exception as e:
+            logger.warning(f"Download Failed ({url}): {e}")
+        return None
+
+    def parse_empress_cc(self):
+        """Парсинг сайту Empress.cc"""
+        url = "https://empress.cc/collections/all"
+        results = []
+        logger.info("📡 Starting Empress.cc sync...")
+        try:
+            resp = requests.get(url, headers=self.get_headers(), timeout=20)
+            soup = BeautifulSoup(resp.text, 'lxml')
             
-            for item in items[:10]: # Обмежимо 10 останніми для швидкості демо
+            # Селектори можуть змінюватися, використовуємо кілька варіантів
+            products = soup.select('.grid-product__content, .product-card, .grid-view-item')
+            
+            for p in products[:15]: # Ліміт для демо
                 try:
-                    title_tag = item.select_one('.grid-product__title, .product-card__title')
-                    price_tag = item.select_one('.grid-product__price, .price-item--regular')
-                    img_tag = item.select_one('img')
-                    link_tag = item.select_one('a')
+                    title_el = p.select_one('.grid-product__title, .product-card__title, .grid-view-item__title')
+                    price_el = p.select_one('.grid-product__price, .price-item--regular')
+                    link_el = p.select_one('a')
+                    img_el = p.select_one('img')
 
-                    if not title_tag or not img_tag: continue
+                    if not title_el or not link_el or not img_el: continue
 
-                    title = title_tag.text.strip()
-                    price = price_tag.text.strip() if price_tag else "N/A"
+                    title = title_el.get_text(strip=True)
+                    price = price_el.get_text(strip=True) if price_el else "N/A"
+                    link = "https://empress.cc" + link_el['href']
                     
-                    # Обробка URL картинки
-                    img_url = img_tag.get('src') or img_tag.get('data-src')
-                    if img_url:
-                        img_url = "https:" + img_url if img_url.startswith('//') else img_url
-                        # Видаляємо параметри розміру (наприклад _300x300)
-                        img_url = re.sub(r'_\d+x\d+', '', img_url)
+                    # Отримання найкращої якості зображення
+                    img_src = img_el.get('data-src') or img_el.get('src')
+                    if img_src:
+                        img_src = "https:" + img_src if img_src.startswith('//') else img_src
+                        img_src = re.sub(r'_\d+x\d+', '', img_src) # Видаляємо розмір
+                        img_src = img_src.split('?')[0]
 
-                    prod_url = "https://empress.cc" + link_tag['href']
-
-                    products.append({
+                    results.append({
                         "title": title,
+                        "url": link,
+                        "image_url": img_src,
                         "price": price,
-                        "url": prod_url,
-                        "image_url": img_url,
                         "source": "Empress.cc"
                     })
                 except Exception as e:
                     continue
-            return products
         except Exception as e:
-            logger.error(f"Empress Sync Error: {e}")
-            return []
+            logger.error(f"Empress Parse Error: {e}")
+        
+        return results
 
     def search_olx(self, query):
-        """Розширений пошук OLX"""
-        clean_q = re.sub(r'[^\w\s]', '', query).strip().replace(' ', '-')
-        # Фільтр: шукаємо з фото, ціна від 100 грн
-        url = f"https://www.olx.ua/uk/list/q-{clean_q}/?search%5Bphotos%5D=1"
+        """Розумний пошук по OLX"""
+        # Очищення запиту
+        clean_query = re.sub(r'[^\w\s]', '', query).strip()
+        clean_query = clean_query.replace(' ', '-')
+        
+        # URL з фільтрами: шукати в заголовках, тільки з фото
+        url = f"https://www.olx.ua/uk/list/q-{clean_query}/?search%5Bphotos%5D=1"
         
         results = []
         try:
-            res = requests.get(url, headers=self._headers(), timeout=15)
-            soup = BeautifulSoup(res.text, 'lxml')
+            resp = requests.get(url, headers=self.get_headers(), timeout=15)
+            soup = BeautifulSoup(resp.text, 'lxml')
             
             cards = soup.find_all('div', {'data-cy': 'l-card'})
             
-            for card in cards[:8]:
+            for card in cards[:10]:
                 try:
-                    link = card.find('a', href=True)
-                    if not link: continue
+                    link_tag = card.find('a', href=True)
+                    if not link_tag: continue
                     
-                    href = link['href']
+                    href = link_tag['href']
                     full_url = href if href.startswith('http') else f"https://www.olx.ua{href}"
                     
-                    # Ігноруємо просунуті (рекламні) оголошення, бо вони часто нерелевантні
-                    if 'promoted' in str(card).lower():
-                        continue
+                    # Ігноруємо рекламу (promoted)
+                    if 'promoted' in str(card).lower(): continue
 
                     title = card.find('h6').text.strip()
+                    
                     price_div = card.find('p', {'data-testid': 'ad-price'})
                     price = price_div.text.strip() if price_div else "?"
                     
-                    img = card.find('img')
-                    img_src = img.get('src') or img.get('data-src')
+                    img_tag = card.find('img')
+                    img_url = img_tag.get('src') or img_tag.get('data-src')
                     
-                    if not img_src: continue
+                    if not img_url: continue
 
-                    is_copy = any(w in title.lower() for w in ["копия", "реплика", "copy", "replica", "aa", "aaa"])
-                    
+                    # Аналіз тексту на репліку
+                    is_replica = any(w in title.lower() for w in ['копия', 'реплика', 'copy', 'replica', 'aaa'])
+
                     results.append({
                         "title": title,
                         "url": full_url,
                         "price": price,
-                        "image_url": img_src,
-                        "is_copy": is_copy
+                        "image_url": img_url,
+                        "is_replica": is_replica
                     })
                 except: continue
         except Exception as e:
-            logger.error(f"OLX Error: {e}")
+            logger.error(f"OLX Search Error: {e}")
             
         return results
 
-scraper = Scraper()
+scraper = ScraperEngine()
 
-# --- 🤖 BOT HANDLERS ---
+# --- 🤖 ЛОГІКА ТЕЛЕГРАМ БОТА ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Доступ заборонено.")
+        return
+
+    stats_sources = len(await JsonDatabase.load(SOURCES_FILE))
     
-    keyboard = [
-        [InlineKeyboardButton("➕ Додати фото", callback_data="add_photo")],
-        [InlineKeyboardButton("🔄 Синхронізація Empress", callback_data="sync_empress")],
-        [InlineKeyboardButton("📋 Список цілей", callback_data="list_targets")],
-        [InlineKeyboardButton("🗑 Очистити все", callback_data="clear_all")]
+    kb = [
+        [InlineKeyboardButton("📸 Додати фото-зразок", callback_data="add_photo")],
+        [InlineKeyboardButton("🌐 Синхронізувати Empress", callback_data="sync_web")],
+        [InlineKeyboardButton(f"📋 Список цілей ({stats_sources})", callback_data="list")],
+        [InlineKeyboardButton("🛑 Очистити базу", callback_data="clear")]
     ]
     
     await update.message.reply_text(
-        "👋 **Вітаю в ExpertCollector Bot!**\n\n"
-        "Система працює 24/7. Я використовую комп'ютерний зір для пошуку колекційних предметів.\n\n"
-        "👇 Оберіть дію:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        f"🖥 **Панель Колекціонера Pro**\n\n"
+        f"Статус: ✅ Активний\n"
+        f"Цілей в базі: {stats_sources}\n"
+        f"Метод: Computer Vision + Web Scraping\n\n"
+        f"Оберіть дію:",
+        reply_markup=InlineKeyboardMarkup(kb),
         parse_mode=ParseMode.MARKDOWN
     )
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
-    if query.data == "add_photo":
-        await query.message.reply_text("📸 Надішліть мені фото предмета, який треба шукати.")
-    
-    elif query.data == "sync_empress":
-        await query.message.reply_text("⏳ Починаю синхронізацію з Empress...")
-        # Виконуємо в окремому потоці, щоб не блокувати бота
-        items = await asyncio.to_thread(scraper.sync_empress)
-        
-        current = await JsonDB.load(SOURCES_FILE)
-        count = 0
-        for item in items:
-            if not any(c['url'] == item['url'] for c in current):
-                current.append(item)
-                count += 1
-        
-        await JsonDB.save(SOURCES_FILE, current)
-        await query.message.reply_text(f"✅ Додано {count} нових лотів з Empress.")
-        
-    elif query.data == "list_targets":
-        sources = await JsonDB.load(SOURCES_FILE)
-        if not sources:
-            await query.message.reply_text("Список пустий.")
-        else:
-            msg = f"📋 **В базі {len(sources)} цілей:**\n"
-            for s in sources[:10]: # Показуємо лише 10 перших
-                msg += f"- [{s['title']}]({s.get('url', '#')})\n"
-            if len(sources) > 10: msg += f"...і ще {len(sources)-10}"
-            await query.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+    data = query.data
 
-    elif query.data == "clear_all":
-        await JsonDB.save(SOURCES_FILE, [])
-        await JsonDB.save(HISTORY_FILE, [])
-        await query.message.reply_text("🗑 База очищена.")
+    if data == "add_photo":
+        await query.message.reply_text("📤 Надішліть фотографію предмета, який ви хочете відслідковувати.")
+
+    elif data == "sync_web":
+        await query.message.reply_text("⏳ Починаю парсинг Empress.cc...")
+        # Виконуємо в окремому потоці
+        items = await asyncio.to_thread(scraper.parse_empress_cc)
+        
+        if items:
+            current_db = await JsonDatabase.load(SOURCES_FILE)
+            added = 0
+            for item in items:
+                # Уникаємо дублікатів по URL
+                if not any(x['url'] == item['url'] for x in current_db):
+                    current_db.append(item)
+                    added += 1
+            
+            await JsonDatabase.save(SOURCES_FILE, current_db)
+            await query.message.reply_text(f"✅ Успішно! Додано {added} нових позицій.")
+        else:
+            await query.message.reply_text("❌ Не вдалося отримати дані або нових товарів немає.")
+
+    elif data == "list":
+        sources = await JsonDatabase.load(SOURCES_FILE)
+        if not sources:
+            await query.message.reply_text("📭 База пуста.")
+        else:
+            text = "📋 **Активні цілі:**\n\n"
+            for i, s in enumerate(sources[:10], 1):
+                text += f"{i}. {s['title']} ({s['price']})\n"
+            if len(sources) > 10:
+                text += f"\n...і ще {len(sources)-10} предметів."
+            await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+    elif data == "clear":
+        await JsonDatabase.save(SOURCES_FILE, [])
+        await JsonDatabase.save(HISTORY_FILE, [])
+        await query.message.reply_text("🗑 Базу даних та історію очищено.")
 
 async def handle_photo_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
@@ -312,69 +378,81 @@ async def handle_photo_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     
-    os.makedirs(DB_IMAGES_DIR, exist_ok=True)
-    file_path = os.path.join(DB_IMAGES_DIR, f"{photo.file_id}.jpg")
+    # Зберігаємо локально
+    filename = f"{int(time.time())}_{photo.file_id[:5]}.jpg"
+    path = os.path.join(IMAGES_DIR, filename)
+    await file.download_to_drive(path)
     
-    await file.download_to_drive(file_path)
-    
-    source_data = {
-        "title": f"Manual Item {photo.file_id[:5]}",
-        "image_url": file_path, # Локальний шлях
-        "url": "local",
+    # Додаємо в БД
+    new_item = {
+        "title": f"Manual Item {filename}",
+        "url": "local_upload",
+        "image_url": path, # Зберігаємо шлях до файлу
         "price": "N/A",
         "source": "User Upload"
     }
     
-    current = await JsonDB.load(SOURCES_FILE)
-    current.append(source_data)
-    await JsonDB.save(SOURCES_FILE, current)
+    db = await JsonDatabase.load(SOURCES_FILE)
+    db.append(new_item)
+    await JsonDatabase.save(SOURCES_FILE, db)
     
-    await update.message.reply_text("✅ Фото додано до бази пошуку!")
+    await update.message.reply_text("✅ Фото прийнято в роботу! Пошук розпочнеться автоматично.")
 
-# --- 🔄 ФОНОВА ЗАДАЧА ---
-async def monitor_task(context: ContextTypes.DEFAULT_TYPE):
-    """Головний цикл пошуку"""
-    sources = await JsonDB.load(SOURCES_FILE)
-    history = await JsonDB.load(HISTORY_FILE)
+# --- 🔄 ФОНОВИЙ МОНІТОРИНГ ---
+async def monitoring_loop(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Головна функція, яка періодично запускається JobQueue.
+    Вона перебирає всі джерела та шукає відповідники.
+    """
+    sources = await JsonDatabase.load(SOURCES_FILE)
+    history = await JsonDatabase.load(HISTORY_FILE)
     
     if not sources: return
+
+    logger.info(f"🔎 Monitoring started for {len(sources)} items...")
     
-    logger.info(f"🔍 Scanning for {len(sources)} targets...")
-    
-    for target in sources:
-        # 1. Отримуємо еталонне зображення
-        # Використовуємо to_thread, бо OpenCV/Requests блокують
-        ref_img = await asyncio.to_thread(vision.get_image_from_source, target['image_url'])
-        if ref_img is None: continue
+    # Вибираємо випадкові 5 предметів для перевірки за один цикл (щоб не блокували)
+    # Якщо база велика, перевіряти все одразу небезпечно
+    batch = random.sample(sources, min(len(sources), 5))
+
+    for target in batch:
+        # 1. Завантажуємо еталонне фото
+        target_img_bytes = await asyncio.to_thread(scraper.download_image_bytes, target['image_url'])
+        target_cv_img = cv_engine.load_image_from_bytes(target_img_bytes)
+        
+        if target_cv_img is None: continue
 
         # 2. Шукаємо на OLX
-        olx_items = await asyncio.to_thread(scraper.search_olx, target['title'])
+        olx_results = await asyncio.to_thread(scraper.search_olx, target['title'])
         
-        for item in olx_items:
+        for item in olx_results:
+            # Перевірка історії
             if item['url'] in history: continue
+
+            # 3. Завантажуємо фото знахідки
+            item_img_bytes = await asyncio.to_thread(scraper.download_image_bytes, item['image_url'])
+            item_cv_img = cv_engine.load_image_from_bytes(item_img_bytes)
+
+            # 4. Порівнюємо
+            similarity = await asyncio.to_thread(cv_engine.compare, target_cv_img, item_cv_img)
             
-            # 3. Порівнюємо зображення
-            scene_img = await asyncio.to_thread(vision.get_image_from_source, item['image_url'])
-            if scene_img is None: continue
-            
-            similarity = await asyncio.to_thread(vision.compare_images, ref_img, scene_img)
-            
-            # Поріг спрацювання (більше 20%)
-            if similarity > 20:
-                logger.info(f"MATCH: {similarity}% - {item['title']}")
+            # Логіка повідомлення (Поріг > 20%)
+            if similarity > 20.0:
+                logger.info(f"MATCH FOUND: {similarity:.1f}% -> {item['title']}")
                 
-                status = "⚠️ КОПІЯ" if item['is_copy'] else "✅ ЙМОВІРНО ОРИГІНАЛ"
-                
+                status_icon = "⚠️ КОПІЯ/РЕПЛІКА" if item['is_replica'] else "✅ ЙМОВІРНО ОРИГІНАЛ"
+                match_grade = "🔥 Висока" if similarity > 50 else "🟡 Середня"
+
                 caption = (
-                    f"🚨 **ЗНАЙДЕНО!**\n\n"
-                    f"🎯 **Ціль:** {target['title']}\n"
-                    f"📦 **Лот:** {item['title']}\n"
-                    f"💰 **Ціна:** {item['price']}\n"
-                    f"🛡 **Статус:** {status}\n"
-                    f"📊 **Схожість:** {similarity:.1f}%\n\n"
-                    f"🔗 [Оголошення на OLX]({item['url']})"
+                    f"🚨 **ЗНАЙДЕНО ВІДПОВІДНИК!**\n\n"
+                    f"🔍 **Шукали:** {target['title']}\n"
+                    f"📦 **Знайдено:** {item['title']}\n"
+                    f"💵 **Ціна:** {item['price']}\n\n"
+                    f"🛡 **Статус:** {status_icon}\n"
+                    f"📊 **Схожість:** {match_grade} ({similarity:.1f}%)\n\n"
+                    f"🔗 [Дивитись на OLX]({item['url']})"
                 )
-                
+
                 try:
                     await context.bot.send_photo(
                         chat_id=CHANNEL_ID,
@@ -382,68 +460,65 @@ async def monitor_task(context: ContextTypes.DEFAULT_TYPE):
                         caption=caption,
                         parse_mode=ParseMode.MARKDOWN
                     )
+                    # Додаємо в історію
                     history.append(item['url'])
-                    await JsonDB.save(HISTORY_FILE, history[-1000:]) # Зберігаємо останні 1000
+                    await JsonDatabase.save(HISTORY_FILE, history[-1000:]) # Тримаємо останні 1000
                 except Exception as e:
-                    logger.error(f"Send Error: {e}")
-            
-            # Невелика пауза, щоб не перевантажити сервер
-            await asyncio.sleep(1)
+                    logger.error(f"Send Telegram Error: {e}")
 
-# --- 🌐 WEB SERVER (HEALTH CHECK) ---
+            # Пауза між запитами
+            await asyncio.sleep(2)
+
+# --- 🌍 WEB SERVER ДЛЯ RENDER/HEROKU ---
 async def health_check(request):
-    return web.Response(text="Bot is running OK", status=200)
+    return web.Response(text="Bot is Alive & Running", status=200)
 
 async def start_web_server():
-    """Запускає веб-сервер для Render/Heroku"""
     app = web.Application()
     app.router.add_get('/', health_check)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
-    logger.info(f"🌍 Web server started on port {PORT}")
+    logger.info(f"🌍 Web Server listening on port {PORT}")
 
-# --- 🚀 INIT ---
-async def post_init(application: Application):
-    """Ініціалізація після запуску"""
-    await start_web_server() # Запускаємо сервер
-    
+# --- 🚀 ЗАПУСК ---
+async def on_startup(application: Application):
+    """Виконується після ініціалізації бота"""
+    await start_web_server()
     try:
         await application.bot.send_message(
             chat_id=CHANNEL_ID,
-            text=f"🤖 **ExpertCollector v2.0 Запущено!**\nМоніторинг активовано."
+            text=f"🤖 **CollectorBot Pro v3.0** запущено!\nМоніторинг активовано."
         )
     except Exception as e:
-        logger.warning(f"Could not send welcome message: {e}")
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log the error and send a telegram message to notify the developer."""
-    logger.error(msg="Exception while handling an update:", exc_info=context.error)
+        logger.warning(f"Welcome message failed: {e}")
 
 def main():
-    # Створення папок
-    os.makedirs(DB_IMAGES_DIR, exist_ok=True)
-    
-    # Ініціалізація Application
-    application = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
-    
-    # Хендлери
+    # ApplicationBuilder - найкраща практика для версій 20.x+
+    application = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .post_init(on_startup) # Хук запуску
+        .get_updates_read_timeout(30)
+        .get_updates_write_timeout(30)
+        .build()
+    )
+
+    # Реєстрація хендлерів
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(CallbackQueryHandler(button_callback))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo_upload))
-    
-    # Обробка помилок
-    application.add_error_handler(error_handler)
-    
-    # Фонові задачі (JobQueue)
+
+    # Реєстрація фонових задач
     if application.job_queue:
-        # Запускаємо пошук кожні 5 хвилин (300 сек)
-        application.job_queue.run_repeating(monitor_task, interval=300, first=10)
+        # Запуск кожні 5 хвилин (300 сек)
+        application.job_queue.run_repeating(monitoring_loop, interval=300, first=20)
+
+    print("🚀 Bot is starting polling...")
     
-    print("Bot is starting...")
-    # drop_pending_updates=True допомагає уникнути конфліктів при перезапуску
-    application.run_polling(drop_pending_updates=True)
+    # drop_pending_updates=True - критично важливо для уникнення Conflict Error
+    application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
