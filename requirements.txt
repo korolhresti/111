@@ -1,9 +1,9 @@
 python-telegram-bot[job-queue]==20.8
-requests
+aiohttp
 beautifulsoup4
 opencv-python-headless
 numpy
 pillow
 lxml
 fake-useragent
-aiohttp
+requests
