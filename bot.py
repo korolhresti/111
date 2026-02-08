@@ -1,344 +1,263 @@
+# ===========================
+# CollectorBot Pro v8.0
+# ===========================
+
 import os
-import sys
 import json
-import time
+import cv2
+import aiohttp
 import asyncio
 import random
 import logging
-import re
-from datetime import datetime
-from io import BytesIO
-
-import requests
-import cv2
 import numpy as np
-from aiohttp import web
-from bs4 import BeautifulSoup
+from datetime import datetime
 from fake_useragent import UserAgent
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    InputMediaPhoto,
-)
-from telegram.constants import ParseMode
+from bs4 import BeautifulSoup
+
+from telegram import Update, InputFile, ReplyKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
-    Application,
     CommandHandler,
-    ContextTypes,
     MessageHandler,
-    CallbackQueryHandler,
+    ContextTypes,
     filters,
 )
 
-# ===================== CONFIG =====================
+# ================= CONFIG =================
+
+VERSION = "8.0"
+
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
-PORT = int(os.getenv("PORT", "8080"))
+ADMIN_ID = int(os.getenv("ADMIN_CHAT_ID"))
+CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 
-SIMILARITY_THRESHOLD = 0.80
-SCRAPE_INTERVAL = int(os.getenv("DEFAULTSCRAPEINTERVAL", "300"))
-BATCH_SIZE = int(os.getenv("BATCHSIZEPER_CYCLE", "5"))
-DEDUPE_WINDOW = int(os.getenv("DEDUPE_WINDOW", "86400"))
+BASE = os.path.dirname(__file__)
+DATA = f"{BASE}/data"
+IMAGES = f"{BASE}/images"
+TARGET_IMG = f"{IMAGES}/targets"
+TEMP_IMG = f"{IMAGES}/temp"
 
-DATA_DIR = "data"
-IMAGES_DIR = os.path.join(DATA_DIR, "images")
-TARGETS_FILE = os.path.join(DATA_DIR, "targets.json")
-HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
-SOURCES_FILE = os.path.join(DATA_DIR, "sources.json")
+for d in [DATA, IMAGES, TARGET_IMG, TEMP_IMG]:
+    os.makedirs(d, exist_ok=True)
 
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(IMAGES_DIR, exist_ok=True)
+FILES = {
+    "targets": f"{DATA}/targets.json",
+    "history": f"{DATA}/history.json",
+    "state": f"{DATA}/state.json",
+}
+
+SIM_THRESHOLD = 80
+
+ua = UserAgent()
+
+# ================= LOG =================
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    format="%(asctime)s | %(message)s",
+    handlers=[logging.StreamHandler()],
 )
-log = logging.getLogger("CollectorBotPro")
+log = logging.getLogger("v8")
 
-# ===================== DB =====================
-class JsonDB:
-    _lock = asyncio.Lock()
+# ================= STORAGE =================
 
-    @staticmethod
-    async def load(path, default):
-        async with JsonDB._lock:
-            if not os.path.exists(path):
-                return default
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except:
-                return default
+def load(path, default):
+    if not os.path.exists(path):
+        return default
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-    @staticmethod
-    async def save(path, data):
-        async with JsonDB._lock:
-            tmp = path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, path)
+def save(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
-# ===================== CV ENGINE =====================
-class CVEngine:
-    def __init__(self):
-        self.orb = cv2.ORB_create(3500)
-        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+TARGETS = load(FILES["targets"], {})
+HISTORY = load(FILES["history"], [])
+STATE = load(FILES["state"], {})
 
-    def load_img(self, b):
+# ================= SECURITY =================
+
+def is_admin(uid):
+    return uid == ADMIN_ID
+
+# ================= CV ENGINE =================
+
+def compare_images(img1_path, img2_path):
+    img1 = cv2.imread(img1_path)
+    img2 = cv2.imread(img2_path)
+
+    if img1 is None or img2 is None:
+        return 0
+
+    orb = cv2.ORB_create(1000)
+    kp1, des1 = orb.detectAndCompute(img1, None)
+    kp2, des2 = orb.detectAndCompute(img2, None)
+
+    if des1 is None or des2 is None:
+        return 0
+
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(des1, des2)
+
+    orb_score = len(matches) / max(len(kp1), 1) * 100
+
+    hsv1 = cv2.cvtColor(img1, cv2.COLOR_BGR2HSV)
+    hsv2 = cv2.cvtColor(img2, cv2.COLOR_BGR2HSV)
+
+    hist1 = cv2.calcHist([hsv1], [0,1], None, [50,60], [0,180,0,256])
+    hist2 = cv2.calcHist([hsv2], [0,1], None, [50,60], [0,180,0,256])
+
+    cv2.normalize(hist1, hist1)
+    cv2.normalize(hist2, hist2)
+
+    color_score = cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL) * 100
+
+    return (orb_score * 0.6 + color_score * 0.4)
+
+# ================= SCRAPER =================
+
+async def fetch(session, url):
+    async with session.get(url, headers={"User-Agent": ua.random}) as r:
+        return await r.text()
+
+# ================= MONITOR LOOP =================
+
+async def monitor_loop(app):
+    while True:
         try:
-            return cv2.imdecode(np.frombuffer(b, np.uint8), cv2.IMREAD_COLOR)
-        except:
-            return None
-
-    def compare(self, a, b):
-        if a is None or b is None:
-            return 0.0
-
-        try:
-            g1 = cv2.cvtColor(a, cv2.COLOR_BGR2GRAY)
-            g2 = cv2.cvtColor(b, cv2.COLOR_BGR2GRAY)
-
-            kp1, d1 = self.orb.detectAndCompute(g1, None)
-            kp2, d2 = self.orb.detectAndCompute(g2, None)
-
-            geo = 0.0
-            if d1 is not None and d2 is not None:
-                matches = self.matcher.match(d1, d2)
-                good = [m for m in matches if m.distance < 55]
-                geo = min(1.0, len(good) / 45)
-
-            hsv1 = cv2.cvtColor(a, cv2.COLOR_BGR2HSV)
-            hsv2 = cv2.cvtColor(b, cv2.COLOR_BGR2HSV)
-
-            h1 = cv2.calcHist([hsv1], [0, 1], None, [50, 60], [0, 180, 0, 256])
-            h2 = cv2.calcHist([hsv2], [0, 1], None, [50, 60], [0, 180, 0, 256])
-            cv2.normalize(h1, h1)
-            cv2.normalize(h2, h2)
-
-            color = max(0, cv2.compareHist(h1, h2, cv2.HISTCMP_CORREL))
-            return geo * 0.7 + color * 0.3
-        except:
-            return 0.0
-
-cv_engine = CVEngine()
-
-# ===================== SCRAPER =====================
-class Scraper:
-    def __init__(self):
-        self.ua = UserAgent()
-
-    def headers(self):
-        return {
-            "User-Agent": self.ua.random,
-            "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8",
-        }
-
-    def download_img(self, url):
-        try:
-            if url.startswith("http"):
-                r = requests.get(url, headers=self.headers(), timeout=15)
-                if r.status_code == 200:
-                    return r.content
-            else:
-                with open(url, "rb") as f:
-                    return f.read()
-        except:
-            return None
-
-    def scan_empress(self):
-        page = 1
-        results = []
-        while True:
-            url = f"https://empress.cc/collections/all?page={page}"
-            r = requests.get(url, headers=self.headers(), timeout=20)
-            soup = BeautifulSoup(r.text, "lxml")
-            cards = soup.select("a.grid-product__link")
-            if not cards:
-                break
-            for c in cards:
-                img = c.find("img")
-                if not img:
-                    continue
-                src = img.get("data-src") or img.get("src")
-                src = src.split("?")[0]
-                results.append({
-                    "id": f"empress_{hash(c['href'])}",
-                    "title": c.get_text(strip=True),
-                    "image_url": "https:" + src if src.startswith("//") else src,
-                    "price": "N/A",
-                    "url": "https://empress.cc" + c["href"],
-                    "source": "empress.cc",
-                    "created": time.time(),
-                })
-            page += 1
-            time.sleep(random.uniform(0.8, 1.5))
-        return results
-
-    def search_olx(self, query):
-        q = re.sub(r"[^\w\s]", "", query).strip().replace(" ", "-")
-        url = f"https://www.olx.ua/uk/list/q-{q}/?search%5Bphotos%5D=1"
-        r = requests.get(url, headers=self.headers(), timeout=15)
-        soup = BeautifulSoup(r.text, "lxml")
-        ads = []
-        for c in soup.find_all("div", {"data-cy": "l-card"}):
-            if "promoted" in str(c).lower():
+            if not TARGETS:
+                await asyncio.sleep(30)
                 continue
-            a = c.find("a", href=True)
-            img = c.find("img")
-            if not a or not img:
-                continue
-            title = c.find("h6").get_text(strip=True)
-            ads.append({
-                "title": title,
-                "url": a["href"],
-                "image_url": img.get("src") or img.get("data-src"),
-                "price": c.find("p", {"data-testid": "ad-price"}).get_text(strip=True)
-                if c.find("p", {"data-testid": "ad-price"}) else "?",
-                "replica": any(x in title.lower() for x in ["копия", "реплика", "replica", "aaa"]),
-            })
-        return ads
 
-scraper = Scraper()
+            sample = random.sample(list(TARGETS.values()), min(3, len(TARGETS)))
 
-# ===================== BOT UI =====================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+            async with aiohttp.ClientSession() as session:
+                for t in sample:
+                    query = t["name"] + " б.у"
+                    url = f"https://www.olx.ua/d/uk/list/q-{query.replace(' ', '-')}/"
+
+                    html = await fetch(session, url)
+                    soup = BeautifulSoup(html, "lxml")
+
+                    for ad in soup.select("div[data-cy='l-card']"):
+                        link = ad.find("a")
+                        if not link:
+                            continue
+
+                        href = "https://www.olx.ua" + link["href"]
+                        if href in HISTORY:
+                            continue
+
+                        HISTORY.append(href)
+                        save(FILES["history"], HISTORY)
+
+                        img = ad.find("img")
+                        if not img or not img.get("src"):
+                            continue
+
+                        img_url = img["src"]
+                        img_path = f"{TEMP_IMG}/{random.randint(1,999999)}.jpg"
+
+                        async with session.get(img_url) as r:
+                            with open(img_path, "wb") as f:
+                                f.write(await r.read())
+
+                        score = compare_images(t["image"], img_path)
+
+                        if score >= SIM_THRESHOLD:
+                            await app.bot.send_photo(
+                                chat_id=CHANNEL_ID,
+                                photo=InputFile(img_path),
+                                caption=(
+                                    f"🚨 MATCH FOUND\n\n"
+                                    f"🎯 {t['name']}\n"
+                                    f"📊 {score:.2f}%\n"
+                                    f"🔗 {href}"
+                                )
+                            )
+
+                        await asyncio.sleep(random.uniform(5, 9))
+
+            save(FILES["history"], HISTORY)
+
+        except Exception as e:
+            log.error(e)
+
+        await asyncio.sleep(300)
+
+# ================= BOT =================
+
+async def start(update: Update, ctx):
+    if not is_admin(update.effective_user.id):
         return
-    kb = [
-        [InlineKeyboardButton("🌐 Sync Empress", callback_data="sync")],
-        [InlineKeyboardButton("📸 Add Photo Target", callback_data="photo")],
-        [InlineKeyboardButton("📋 List Targets", callback_data="list")],
-        [InlineKeyboardButton("🗑 Clear All", callback_data="clear")],
-    ]
+
     await update.message.reply_text(
-        "🖥 CollectorBot Pro Admin Panel",
-        reply_markup=InlineKeyboardMarkup(kb),
+        f"🤖 CollectorBot v{VERSION}\n\n"
+        "Команди:\n"
+        "/add_target\n"
+        "/list_targets\n"
+        "/clear_targets"
     )
 
-async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+async def add_target(update: Update, ctx):
+    STATE[str(update.effective_user.id)] = "await_photo"
+    save(FILES["state"], STATE)
+    await update.message.reply_text("📸 Надішли фото еталона")
 
-    if q.data == "sync":
-        await q.message.reply_text("⏳ Syncing empress.cc ...")
-        items = await asyncio.to_thread(scraper.scan_empress)
-        targets = await JsonDB.load(TARGETS_FILE, [])
-        added = 0
-        for i in items:
-            if not any(t["url"] == i["url"] for t in targets):
-                targets.append(i)
-                added += 1
-        await JsonDB.save(TARGETS_FILE, targets)
-        await q.message.reply_text(f"✅ Added {added} items")
-
-    if q.data == "list":
-        t = await JsonDB.load(TARGETS_FILE, [])
-        msg = "\n".join([f"{i+1}. {x['title']}" for i, x in enumerate(t[:25])])
-        await q.message.reply_text(msg or "Empty")
-
-    if q.data == "clear":
-        await JsonDB.save(TARGETS_FILE, [])
-        await JsonDB.save(HISTORY_FILE, {})
-        await q.message.reply_text("🗑 Cleared")
-
-async def add_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    p = update.message.photo[-1]
-    f = await context.bot.get_file(p.file_id)
-    path = os.path.join(IMAGES_DIR, f"{p.file_id}.jpg")
-    await f.download_to_drive(path)
-    targets = await JsonDB.load(TARGETS_FILE, [])
-    targets.append({
-        "id": f"manual_{p.file_id}",
-        "title": "Manual Item",
-        "image_url": path,
-        "price": "N/A",
-        "url": path,
-        "source": "manual",
-        "created": time.time(),
-    })
-    await JsonDB.save(TARGETS_FILE, targets)
-    await update.message.reply_text("✅ Photo target added")
-
-# ===================== MONITOR LOOP =====================
-async def monitor(context: ContextTypes.DEFAULT_TYPE):
-    targets = await JsonDB.load(TARGETS_FILE, [])
-    history = await JsonDB.load(HISTORY_FILE, {})
-    if not targets:
+async def photo_handler(update: Update, ctx):
+    uid = str(update.effective_user.id)
+    if STATE.get(uid) != "await_photo":
         return
 
-    batch = random.sample(targets, min(BATCH_SIZE, len(targets)))
-    for t in batch:
-        tb = scraper.download_img(t["image_url"])
-        ti = cv_engine.load_img(tb) if tb else None
+    photo = update.message.photo[-1]
+    path = f"{TARGET_IMG}/{photo.file_id}.jpg"
+    await photo.get_file().download_to_drive(path)
 
-        queries = [
-            t["title"],
-            f"{t['title']} б.у",
-            f"{t['title']} used",
-        ]
+    TARGETS[photo.file_id] = {
+        "name": "Manual Target",
+        "image": path,
+        "created": datetime.utcnow().isoformat(),
+    }
+    save(FILES["targets"], TARGETS)
 
-        for q in queries:
-            ads = await asyncio.to_thread(scraper.search_olx, q)
-            for ad in ads:
-                if ad["url"] in history and time.time() - history[ad["url"]] < DEDUPE_WINDOW:
-                    continue
+    STATE.pop(uid)
+    save(FILES["state"], STATE)
 
-                ab = scraper.download_img(ad["image_url"])
-                ai = cv_engine.load_img(ab) if ab else None
-                score = cv_engine.compare(ti, ai)
+    await update.message.reply_text("✅ Ціль додана")
 
-                if score >= SIMILARITY_THRESHOLD:
-                    status = "⚠️ Replica" if ad["replica"] else "✅ Original"
-                    text = (
-                        f"🚨 MATCH FOUND\n"
-                        f"🔍 Target: {t['title']}\n"
-                        f"📦 Found: {ad['title']}\n"
-                        f"💵 Price: {ad['price']}\n"
-                        f"📊 Similarity: {int(score*100)}%\n"
-                        f"{status}\n"
-                        f"{ad['url']}"
-                    )
-                    await context.bot.send_message(CHANNEL_ID, text)
-                    history[ad["url"]] = time.time()
-                    await JsonDB.save(HISTORY_FILE, history)
+async def list_targets(update: Update, ctx):
+    if not TARGETS:
+        return await update.message.reply_text("❌ Немає цілей")
 
-                await asyncio.sleep(random.uniform(1.5, 3.5))
+    msg = "\n".join([f"- {t['name']}" for t in TARGETS.values()])
+    await update.message.reply_text(msg)
 
-# ===================== WEB =====================
-async def health(req):
-    return web.Response(text="OK")
+async def clear_targets(update: Update, ctx):
+    TARGETS.clear()
+    save(FILES["targets"], TARGETS)
+    await update.message.reply_text("🧹 Очищено")
 
-async def web_server():
-    app = web.Application()
-    app.router.add_get("/", health)
-    r = web.AppRunner(app)
-    await r.setup()
-    s = web.TCPSite(r, "0.0.0.0", PORT)
-    await s.start()
+# ================= MAIN =================
 
-async def post_init(app: Application):
-    await web_server()
-    try:
-        await app.bot.send_message(ADMIN_ID, "🤖 CollectorBot Pro Started")
-    except:
-        pass
+async def post_init(app):
+    app.create_task(monitor_loop(app))
 
-# ===================== MAIN =====================
 def main():
-    app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
+    app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(callbacks))
-    app.add_handler(MessageHandler(filters.PHOTO, add_photo))
-    if app.job_queue:
-        app.job_queue.run_repeating(monitor, interval=SCRAPE_INTERVAL, first=30)
+    app.add_handler(CommandHandler("add_target", add_target))
+    app.add_handler(CommandHandler("list_targets", list_targets))
+    app.add_handler(CommandHandler("clear_targets", clear_targets))
+    app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+
+    log.info("🚀 BOT v8 STARTED")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
-                                  
