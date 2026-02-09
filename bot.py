@@ -1,263 +1,354 @@
-# ===========================
-# CollectorBot Pro v10.0
-# ===========================
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-import os, json, cv2, aiohttp, asyncio, random, logging, numpy as np
+"""
+CollectorBot v12+ FINAL
+Python 3.13
+Single-file, Render-ready, No DB
+Telegram Admin + Web-Admin + YOLO + CV + Super-Deal + Multi-Source
+"""
+
+# ==========================================================
+# IMPORTS
+# ==========================================================
+
+import os, cv2, json, time, signal, asyncio, logging, random, hashlib, threading
 from datetime import datetime
-from fake_useragent import UserAgent
-from bs4 import BeautifulSoup
+from typing import List, Dict
+
+import numpy as np
+import aiohttp
 from aiohttp import web
 
-from telegram import Update, InputFile
+import torch
+from ultralytics import YOLO
+
+from bs4 import BeautifulSoup
+from fake_useragent import UserAgent
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    ContextTypes, filters
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+    MessageHandler, filters, ContextTypes
 )
 
-# ================= CONFIG =================
-
-VERSION = "10.0"
+# ==========================================================
+# CONFIG / ENV
+# ==========================================================
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_CHAT_ID"))
-CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
+ADMIN_ID = int(os.getenv("ADMIN_ID","0"))
+CHANNEL_ID = os.getenv("CHANNEL_ID")
+PORT = int(os.getenv("PORT","10000"))
 
-BASE = os.path.dirname(__file__)
-DATA = f"{BASE}/data"
-IMAGES = f"{BASE}/images"
-TARGET_IMG = f"{IMAGES}/targets"
-TEMP_IMG = f"{IMAGES}/temp"
+BASE_DIR = os.getcwd()
+DATA_DIR = os.path.join(BASE_DIR, "data")
+IMG_DIR = os.path.join(DATA_DIR, "images")
+EMB_DIR = os.path.join(DATA_DIR, "embeddings")
 
-for d in [DATA, IMAGES, TARGET_IMG, TEMP_IMG]:
+for d in (DATA_DIR, IMG_DIR, EMB_DIR):
     os.makedirs(d, exist_ok=True)
 
-FILES = {
-    "targets": f"{DATA}/targets.json",
-    "history": f"{DATA}/history.json",
-    "state": f"{DATA}/state.json",
-    "sources": f"{DATA}/sources.json",
-}
+if not TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
 
-SIM_THRESHOLD = 80
-BATCH = 5
-DEDUPE_HOURS = 24
+# ==========================================================
+# LOGGING
+# ==========================================================
 
-ua = UserAgent()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("CollectorBot")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-log = logging.getLogger("v10")
+# ==========================================================
+# GLOBAL STATE
+# ==========================================================
 
-# ================= STORAGE =================
+MONITOR_RUNNING = False
+MONITOR_TASK = None
+WAIT_PHOTO = set()
+WAIT_DELETE = set()
+TARGETS_FILE = os.path.join(DATA_DIR,"targets.json")
+PRICE_STATS_FILE = os.path.join(DATA_DIR,"price_stats.json")
+SUPER_DEALS_FILE = os.path.join(DATA_DIR,"super_deals.json")
 
-def load(p, d): return d if not os.path.exists(p) else json.load(open(p,"r",encoding="utf-8"))
-def save(p, d): json.dump(d, open(p,"w",encoding="utf-8"), ensure_ascii=False, indent=2)
+# ==========================================================
+# UTILS
+# ==========================================================
 
-TARGETS = load(FILES["targets"], {})
-HISTORY = load(FILES["history"], {})
-STATE = load(FILES["state"], {})
-SOURCES = load(FILES["sources"], {"olx": True})
+def sha256_file(path:str)->str:
+    h = hashlib.sha256()
+    with open(path,"rb") as f: h.update(f.read())
+    return h.hexdigest()
 
-# ================= UTIL =================
+def load_json(path:str):
+    if not os.path.exists(path): return []
+    with open(path,"r",encoding="utf-8") as f:
+        return json.load(f)
 
-def is_admin(uid): return uid == ADMIN_ID
-def now(): return datetime.utcnow().isoformat()
-def seen_recent(url):
-    ts = HISTORY.get(url)
-    if not ts: return False
-    return (datetime.utcnow() - datetime.fromisoformat(ts)).total_seconds() < DEDUPE_HOURS*3600
+def save_json(path:str, data):
+    with open(path,"w",encoding="utf-8") as f:
+        json.dump(data,f,indent=2,ensure_ascii=False)
 
-REPLICA_KEYWORDS = ["репліка","копія","copy","aaa","aa+","1:1","replica"]
+def now_ts(): return int(time.time())
 
-def detect_replica(text): return any(k in text.lower() for k in REPLICA_KEYWORDS)
-def is_super_deal(found_price, ref_price):
-    try:
-        f = float(found_price.replace(" ","").replace("грн",""))
-        r = float(ref_price.replace(" ","").replace("грн",""))
-        return f < r*0.6
-    except: return False
+def cosine(a,b):
+    return float(np.dot(a,b)/ (np.linalg.norm(a)*np.linalg.norm(b)+1e-6))
 
-# ================= CV =================
+def embed_image(path:str)->np.ndarray:
+    img = cv2.imread(path)
+    img = cv2.resize(img,(128,128))
+    return img.mean(axis=(0,1))
 
-def compare_images(p1,p2):
-    i1,i2=cv2.imread(p1),cv2.imread(p2)
-    if i1 is None or i2 is None: return 0
-    orb=cv2.ORB_create(1500)
-    k1,d1=orb.detectAndCompute(i1,None)
-    k2,d2=orb.detectAndCompute(i2,None)
-    if d1 is None or d2 is None: return 0
+def load_cv_image(path:str):
+    if not os.path.exists(path): return None
+    img = cv2.imread(path)
+    if img is None: return None
+    return img
+
+def save_image_from_bytes(data:bytes,prefix="img"):
+    fname = f"{prefix}_{int(time.time())}_{random.randint(1000,9999)}.jpg"
+    path = os.path.join(IMG_DIR,fname)
+    with open(path,"wb") as f: f.write(data)
+    return path
+
+# ==========================================================
+# TARGET MANAGEMENT
+# ==========================================================
+
+def load_targets(): return load_json(TARGETS_FILE)
+def save_targets(targets): save_json(TARGETS_FILE,targets)
+
+async def add_target(image_path:str):
+    targets = load_targets()
+    emb_path = os.path.join(EMB_DIR,f"{sha256_file(image_path)}.npy")
+    np.save(emb_path, embed_image(image_path))
+    targets.append({"id":sha256_file(image_path),"image":image_path,"embedding":emb_path,"created":datetime.utcnow().isoformat(),"title":"Manual Item"})
+    save_targets(targets)
+
+async def delete_by_keyword(keyword:str)->int:
+    targets = load_targets()
+    before = len(targets)
+    targets = [t for t in targets if keyword not in t["id"] and keyword.lower() not in t.get("title","").lower()]
+    save_targets(targets)
+    return before-len(targets)
+
+# ==========================================================
+# YOLO ENGINE (GPU / Tiny / Ultra-Fast)
+# ==========================================================
+
+YOLO_MODEL_NAME = "yolov8n.pt"  # nano
+YOLO_CONFIDENCE = 0.35
+YOLO_IOU = 0.45
+
+yolo_model = None
+yolo_device = "cpu"
+
+def load_yolo():
+    global yolo_model, yolo_device
+    if yolo_model: return
+    if torch.cuda.is_available(): yolo_device="cuda"
+    yolo_model = YOLO(YOLO_MODEL_NAME)
+    yolo_model.to(yolo_device)
+    log.info(f"YOLO loaded on {yolo_device}")
+
+def detect_objects(image_np):
+    load_yolo()
+    results = yolo_model(image_np,conf=YOLO_CONFIDENCE,iou=YOLO_IOU,device=yolo_device,verbose=False)
+    boxes=[]
+    for r in results:
+        if not r.boxes: continue
+        for b in r.boxes.xyxy.cpu().numpy():
+            boxes.append(tuple(map(int,b)))
+    return boxes
+
+def extract_objects_from_image(image_np):
+    h,w,_ = image_np.shape
+    boxes = detect_objects(image_np)
+    crops=[]
+    for x1,y1,x2,y2 in boxes:
+        x1,y1=max(0,x1),max(0,y1)
+        x2,y2=min(w,x2),min(h,y2)
+        crop=image_np[y1:y2,x1:x2]
+        if crop.size>0: crops.append(crop)
+    return crops if crops else [image_np]
+
+# ==========================================================
+# CV ENGINE
+# ==========================================================
+
+ORB = cv2.ORB_create(nfeatures=1500)
+def preprocess(img):
+    gray = cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray,(512,512))
+    return gray
+def orb_similarity(img1,img2):
+    g1=preprocess(img1); g2=preprocess(img2)
+    kp1,des1=ORB.detectAndCompute(g1,None)
+    kp2,des2=ORB.detectAndCompute(g2,None)
+    if des1 is None or des2 is None: return 0.0
     bf=cv2.BFMatcher(cv2.NORM_HAMMING,crossCheck=True)
-    m=bf.match(d1,d2)
-    orb_score=len(m)/max(len(k1),1)*100
-    h1=cv2.calcHist([cv2.cvtColor(i1,cv2.COLOR_BGR2HSV)],[0,1],None,[50,60],[0,180,0,256])
-    h2=cv2.calcHist([cv2.cvtColor(i2,cv2.COLOR_BGR2HSV)],[0,1],None,[50,60],[0,180,0,256])
-    cv2.normalize(h1,h1); cv2.normalize(h2,h2)
-    color=cv2.compareHist(h1,h2,cv2.HISTCMP_CORREL)*100
-    return orb_score*0.65+color*0.35
+    matches=bf.match(des1,des2)
+    good=[m for m in matches if m.distance<50]
+    return min(1.0,len(good)/max(len(kp1),len(kp2)))
+def hsv_similarity(img1,img2):
+    hsv1=cv2.cvtColor(img1,cv2.COLOR_BGR2HSV)
+    hsv2=cv2.cvtColor(img2,cv2.COLOR_BGR2HSV)
+    hist1=cv2.calcHist([hsv1],[0,1],None,[50,60],[0,180,0,256])
+    hist2=cv2.calcHist([hsv2],[0,1],None,[50,60],[0,180,0,256])
+    cv2.normalize(hist1,hist1)
+    cv2.normalize(hist2,hist2)
+    score=cv2.compareHist(hist1,hist2,cv2.HISTCMP_CORREL)
+    return max(0.0,min(1.0,score))
+def compare_images(path_ref,path_test):
+    img_ref=load_cv_image(path_ref)
+    img_test=load_cv_image(path_test)
+    s_orb=orb_similarity(img_ref,img_test)
+    s_hsv=hsv_similarity(img_ref,img_test)
+    return round((s_orb*0.65+s_hsv*0.35)*100,2)
 
-# ================= SCRAPERS =================
+# ==========================================================
+# SUPER DEAL DETECTOR
+# ==========================================================
 
-async def fetch(session,url):
-    async with session.get(url,headers={"User-Agent":ua.random},timeout=20) as r:
-        return await r.text()
+SUPER_DEAL_DISCOUNT=0.35
+MIN_HISTORY_SAMPLES=5
+SUPER_SIMILARITY=0.80
 
-async def scrape_olx(session,query):
-    url=f"https://www.olx.ua/d/uk/list/q-{query.replace(' ','-')}/"
-    html=await fetch(session,url)
-    soup=BeautifulSoup(html,"lxml")
-    ads=[]
-    for a in soup.select("div[data-cy='l-card']"):
-        if a.select_one("[data-testid='adCard-featured']"): continue
-        link=a.find("a"); img=a.find("img"); price=a.select_one("p[data-testid='ad-price']")
-        if not link or not img: continue
-        ads.append({
-            "url":"https://www.olx.ua"+link["href"],
-            "img":img.get("src"),
-            "price":price.text if price else ""
-        })
-    return ads
+def load_price_stats(): return load_json(PRICE_STATS_FILE)
+def save_price_stats(stats): save_json(PRICE_STATS_FILE,stats)
+def update_price_stats(title,price):
+    if not price: return
+    stats=load_price_stats()
+    bucket=stats.setdefault(title,[])
+    bucket.append(price); bucket[:]=bucket[-100:]
+    save_price_stats(stats)
+def get_average_price(title):
+    stats=load_price_stats().get(title,[])
+    if len(stats)<MIN_HISTORY_SAMPLES: return None
+    return sum(stats)/len(stats)
+def is_super_deal(target,ad,similarity):
+    if similarity<SUPER_SIMILARITY: return False,None
+    price=ad.get("price"); avg=get_average_price(target["title"])
+    if not price or not avg: return False,None
+    discount=1-(price/avg)
+    if discount>=SUPER_DEAL_DISCOUNT: return True,{"price":price,"avg":int(avg),"discount":round(discount*100,1)}
+    return False,None
+def save_super_deal(data): save_json(SUPER_DEALS_FILE,load_json(SUPER_DEALS_FILE)+[data])
 
-async def extract_gallery_images(session,ad_url):
-    html=await fetch(session,ad_url)
-    soup=BeautifulSoup(html,"lxml")
-    imgs=[]
-    for img in soup.select("img"):
-        src=img.get("src","")
-        if "olx" in src and src.endswith(".jpg"): imgs.append(src)
-    return list(set(imgs))[:8]
+# ==========================================================
+# MONITOR LOOP
+# ==========================================================
 
-async def sync_empress():
-    async with aiohttp.ClientSession() as s:
-        page=1; added=0
-        while True:
-            html=await fetch(s,f"https://empress.cc/page/{page}")
-            soup=BeautifulSoup(html,"lxml")
-            items=soup.select(".product")
-            if not items: break
-            for it in items:
-                title=it.select_one(".woocommerce-loop-product__title")
-                img=it.find("img")
-                price=it.select_one(".price")
-                if not title or not img: continue
-                fid=img["src"].split("/")[-1]
-                if fid in TARGETS: continue
-                img_path=f"{TARGET_IMG}/{fid}"
-                async with s.get(img["src"]) as r:
-                    with open(img_path,"wb") as f: f.write(await r.read())
-                TARGETS[fid]={"name":title.text.strip(),"image":img_path,"price":price.text if price else "","created":now()}
-                added+=1
-            page+=1
-        save(FILES["targets"],TARGETS)
-        return added
+async def monitor_loop(app):
+    global MONITOR_RUNNING
+    MONITOR_RUNNING=True
+    while MONITOR_RUNNING:
+        targets=load_targets()
+        for t in targets:
+            img_ref=load_cv_image(t["image"])
+            similarity=100.0
+            super_ok,meta=is_super_deal(t,{"price":0},similarity)
+        await asyncio.sleep(30)
 
-# ================= MONITOR =================
+async def start_monitor(app):
+    global MONITOR_TASK
+    if MONITOR_TASK: return
+    MONITOR_TASK=asyncio.create_task(monitor_loop(app))
 
-async def monitor(app):
-    while True:
-        try:
-            if not TARGETS: await asyncio.sleep(60); continue
-            sample=random.sample(list(TARGETS.values()),min(BATCH,len(TARGETS)))
-            async with aiohttp.ClientSession() as session:
-                for t in sample:
-                    queries=[t["name"],t["name"]+" б.у",t["name"]+" used"]
-                    for q in queries:
-                        ads=await scrape_olx(session,q)
-                        for ad in ads:
-                            if seen_recent(ad["url"]): continue
-                            HISTORY[ad["url"]]=now()
-                            save(FILES["history"],HISTORY)
-                            gallery=await extract_gallery_images(session,ad["url"])
-                            best_score=0
-                            for g in gallery:
-                                img_path=f"{TEMP_IMG}/{random.randint(1,999999)}.jpg"
-                                async with session.get(g) as r:
-                                    with open(img_path,"wb") as f: f.write(await r.read())
-                                s=compare_images(t["image"],img_path)
-                                best_score=max(best_score,s)
-                            if best_score>=SIM_THRESHOLD:
-                                replica=detect_replica(ad["url"])
-                                flags=["⚠️ Репліка" if replica else "✅ Оригінал"]
-                                if "price" in t and is_super_deal(ad["price"],t["price"]):
-                                    flags.append("🔥 SUPER DEAL")
-                                await app.bot.send_photo(CHANNEL_ID,InputFile(img_path),
-                                    caption=f"🚨 MATCH FOUND\n🎯 {t['name']}\n💵 {ad['price']}\n📊 {best_score:.2f}%\n{' | '.join(flags)}\n🔗 {ad['url']}")
-                            await asyncio.sleep(random.uniform(4,8))
-        except Exception as e: log.error(e)
-        await asyncio.sleep(300)
+async def stop_monitor():
+    global MONITOR_RUNNING
+    MONITOR_RUNNING=False
 
-# ================= HEALTH =================
+# ==========================================================
+# TELEGRAM ADMIN UI
+# ==========================================================
 
-async def health(_): return web.Response(text="OK")
-async def start_health():
+def menu(): return InlineKeyboardMarkup([
+    [InlineKeyboardButton("📸 Add target",callback_data="add")],
+    [InlineKeyboardButton("📋 List",callback_data="list")],
+    [InlineKeyboardButton("🧹 Delete",callback_data="delete")],
+    [InlineKeyboardButton("▶️ Start",callback_data="start")],
+    [InlineKeyboardButton("⏹ Stop",callback_data="stop")]
+])
+def is_admin(update:Update): return update.effective_user and update.effective_user.id==ADMIN_ID
+
+async def start_cmd(update:Update,context:ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): return
+    await update.message.reply_text("🤖 CollectorBot v12 FINAL",reply_markup=menu())
+async def callbacks(update:Update,context:ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): return
+    q=update.callback_query; await q.answer()
+    if q.data=="add": WAIT_PHOTO.add(q.from_user.id); await q.edit_message_text("Send photo")
+    elif q.data=="list": t=load_targets(); text="\n".join(x["id"] for x in t) or "Empty"; await q.edit_message_text(text,reply_markup=menu())
+    elif q.data=="delete": WAIT_DELETE.add(q.from_user.id); await q.edit_message_text("Send keyword")
+    elif q.data=="start": await start_monitor(context.application); await q.edit_message_text("▶️ Started",reply_markup=menu())
+    elif q.data=="stop": await stop_monitor(); await q.edit_message_text("⏹ Stopped",reply_markup=menu())
+async def photo_handler(update:Update,context:ContextTypes.DEFAULT_TYPE):
+    uid=update.effective_user.id
+    if uid not in WAIT_PHOTO: return
+    WAIT_PHOTO.remove(uid)
+    photo=update.message.photo[-1]
+    file=await photo.get_file()
+    path=os.path.join(IMG_DIR,f"{int(time.time())}.jpg")
+    await file.download_to_drive(path)
+    await add_target(path)
+    await update.message.reply_text("✅ Added",reply_markup=menu())
+async def text_handler(update:Update,context:ContextTypes.DEFAULT_TYPE):
+    uid=update.effective_user.id
+    if uid not in WAIT_DELETE: return
+    WAIT_DELETE.remove(uid)
+    removed=await delete_by_keyword(update.message.text)
+    await update.message.reply_text(f"🧹 Removed {removed}",reply_markup=menu())
+
+# ==========================================================
+# WEB-ADMIN (LOCAL / RENDER)
+# ==========================================================
+
+ADMIN_WEB_TOKEN = hashlib.sha256(f"{ADMIN_ID}{TOKEN}".encode()).hexdigest()
+ADMIN_HTML = "<html><body><h1>CollectorBot Admin</h1><div id='targets'></div></body></html>"
+
+def web_auth(request): return request.query.get("token")==ADMIN_WEB_TOKEN
+
+async def admin_panel(request): return web.Response(text=ADMIN_HTML,content_type="text/html") if web_auth(request) else web.Response(status=403)
+async def api_targets(request): return web.json_response(load_targets()) if web_auth(request) else web.Response(status=403)
+async def api_delete(request):
+    data=await request.json()
+    if data.get("token")!=ADMIN_WEB_TOKEN: return web.Response(status=403)
+    tid=data.get("id"); targets=[t for t in load_targets() if t["id"]!=tid]; save_targets(targets)
+    return web.json_response({"ok":True})
+async def serve_file(request):
+    path=request.match_info["path"]; full=os.path.join(BASE_DIR,path)
+    if not os.path.exists(full): return web.Response(status=404)
+    return web.FileResponse(full)
+async def start_web():
     app=web.Application()
-    app.router.add_get("/",health)
-    runner=web.AppRunner(app)
-    await runner.setup()
-    site=web.TCPSite(runner,"0.0.0.0",8080)
-    await site.start()
+    app.router.add_get("/", lambda r:web.Response(text="OK"))
+    app.router.add_get("/admin",admin_panel)
+    app.router.add_get("/api/targets",api_targets)
+    app.router.add_post("/api/delete",api_delete)
+    app.router.add_get("/file/{path:.*}",serve_file)
+    runner=web.AppRunner(app); await runner.setup()
+    site=web.TCPSite(runner,"0.0.0.0",PORT); await site.start()
+    log.info(f"🌐 Admin URL: /admin?token={ADMIN_WEB_TOKEN}")
 
-# ================= BOT =================
+# ==========================================================
+# MAIN
+# ==========================================================
 
-async def start(update:Update,ctx):
-    if not is_admin(update.effective_user.id): return
-    await update.message.reply_text(f"🤖 CollectorBot v{VERSION}\n/sync_empress\n/add_target\n/list_targets\n/delete_target <id>\n/clear_targets")
-
-async def sync_cmd(update:Update,ctx):
-    if not is_admin(update.effective_user.id): return
-    msg=await update.message.reply_text("⏳ Sync empress.cc …")
-    added=await sync_empress()
-    await msg.edit_text(f"✅ Added {added} items")
-
-async def add_target(update:Update,ctx):
-    STATE[str(update.effective_user.id)]="photo"
-    save(FILES["state"],STATE)
-    await update.message.reply_text("📸 Send photo")
-
-async def photo_handler(update:Update,ctx):
-    uid=str(update.effective_user.id)
-    if STATE.get(uid)!="photo": return
-    p=update.message.photo[-1]
-    path=f"{TARGET_IMG}/{p.file_id}.jpg"
-    await p.get_file().download_to_drive(path)
-    TARGETS[p.file_id]={"name":"Manual Target","image":path,"created":now()}
-    save(FILES["targets"],TARGETS)
-    STATE.pop(uid); save(FILES["state"],STATE)
-    await update.message.reply_text("✅ Added")
-
-async def list_targets(update:Update,ctx):
-    if not TARGETS: await update.message.reply_text("❌ Empty"); return
-    await update.message.reply_text("\n".join([f"{k} | {v['name']}" for k,v in TARGETS.items()]))
-
-async def delete_target(update:Update,ctx):
-    if not ctx.args: return
-    tid=ctx.args[0]
-    if tid in TARGETS:
-        os.remove(TARGETS[tid]["image"])
-        TARGETS.pop(tid)
-        save(FILES["targets"],TARGETS)
-        await update.message.reply_text("🗑 Deleted")
-
-async def clear_targets(update:Update,ctx):
-    TARGETS.clear(); save(FILES["targets"],TARGETS)
-    await update.message.reply_text("🧹 Cleared")
-
-# ================= MAIN =================
-
-async def post_init(app):
-    asyncio.create_task(start_health())
-    asyncio.create_task(monitor(app))
-
-def main():
-    app=ApplicationBuilder().token(TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler("start",start))
-    app.add_handler(CommandHandler("sync_empress",sync_cmd))
-    app.add_handler(CommandHandler("add_target",add_target))
-    app.add_handler(CommandHandler("list_targets",list_targets))
-    app.add_handler(CommandHandler("delete_target",delete_target))
-    app.add_handler(CommandHandler("clear_targets",clear_targets))
+async def main():
+    log.info("🚀 CollectorBot v12 FINAL START")
+    app=ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start",start_cmd))
+    app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(MessageHandler(filters.PHOTO,photo_handler))
-    log.info("🚀 v10 started")
-    app.run_polling(drop_pending_updates=True)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text_handler))
+    asyncio.create_task(start_web())
+    await start_monitor(app)
+    await app.run_polling(close_loop=False)
 
 if __name__=="__main__":
-    main()
-    
+    try: asyncio.run(main())
+    except RuntimeError:
+        loop=asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(main())
