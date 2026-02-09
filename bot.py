@@ -418,24 +418,30 @@ class OmniBot:
             await q.edit_message_text(f"📦 **Ваші цілі:**\n{res}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="back")]]))
 
     async def handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if context.user_data.get("state") == "wait_img":
+        if context.user_data.get("st") == "img":
             file = await update.message.photo[-1].get_file()
-            path = MEDIA_DIR / "targets" / f"ref_{secrets.token_hex(4)}.jpg"
+            path = str(MEDIA_DIR / "targets" / f"ref_{secrets.token_hex(4)}.jpg")
             await file.download_to_drive(path)
             
-            # YOLO Детекція
+            # Отримуємо результати YOLO
             y = await vision.get_yolo()
-            res = y(str(path))
-            detected = [y.names[int(c)] for c in res[0].boxes.cls]
+            results = y(path)
+            detected_list = [y.names[int(c)] for c in results[0].boxes.cls]
             
-            context.user_data["tmp_p"] = str(path)
-            context.user_data["state"] = "wait_name"
+            # Готуємо текст окремо, щоб уникнути конфліктів лапок у f-string
+            if detected_list:
+                ai_vision_text = ", ".join(detected_list)
+            else:
+                ai_vision_text = "Обʼєкт"  # Використовуємо модифікований апостроф (U+02BC) або просто текст
             
-            # ВИПРАВЛЕНО: Використовуємо подвійні лапки для f-рядка
-            await update.message.reply_text(
-                f"✅ Фото завантажено. AI бачить: {', '.join(detected) if detected else 'Об'єкт'}.\n"
-                "Введіть **НАЗВУ** товару для пошуку:"
-            )
+            context.user_data.update({"tmp": path, "st": "name"})
+            
+            # Використовуємо потрійні лапки для максимальної безпеки синтаксису
+            response_text = f"""✅ Фото завантажено. 
+AI бачить: {ai_vision_text}.
+Тепер введіть НАЗВУ товару для пошуку:"""
+            
+            await update.message.reply_text(response_text)
 
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if context.user_data.get("state") == "wait_name":
