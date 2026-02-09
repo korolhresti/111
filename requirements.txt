@@ -8,3 +8,4 @@ fake-useragent
 numpy
 aiofiles
 lxml
+scikit-image
