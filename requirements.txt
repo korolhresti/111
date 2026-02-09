@@ -1,9 +1,8 @@
-python-telegram-bot[job-queue]==20.8
+torch
+ultralytics
+python-telegram-bot
+opencv-python-headless
 aiohttp
 beautifulsoup4
-opencv-python-headless
-numpy
-pillow
-lxml
 fake-useragent
-requests
+numpy
