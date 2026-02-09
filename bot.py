@@ -430,7 +430,10 @@ class OmniBot:
             
             context.user_data["tmp_p"] = str(path)
             context.user_data["state"] = "wait_name"
-            await update.message.reply_text(f"✅ AI бачить: {', '.join(det) if det else 'Об'єкт'}.\nВведіть назву:")
+            
+            # ВИПРАВЛЕНО: Використовуємо подвійні лапки для f-рядка
+            await update.message.reply_text(
+                f"✅ Фото завантажено. AI бачить: {', '.join(detected) if detected else 'Об'єкт'}.\n"
                 "Введіть **НАЗВУ** товару для пошуку:"
             )
 
