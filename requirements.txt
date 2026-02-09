@@ -6,3 +6,5 @@ aiohttp
 beautifulsoup4
 fake-useragent
 numpy
+aiofiles
+lxml
