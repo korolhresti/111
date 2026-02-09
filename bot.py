@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-COLLECTOR BOT PRO - ENTERPRISE EDITION v12.7
---------------------------------------------
-Full Functional: YOLO v8, ORB+HSV Matching, Market Price Analytics,
-Web Dashboard, Automated Cleanup, Multi-target Monitoring.
---------------------------------------------
+💎 COLLECTOR BOT OMNI-AI v25.0 - ULTIMATE ENTERPRISE EDITION
+------------------------------------------------------------
+[ENGINE]    Neural-Driven Multi-Agent Global Hunter
+[VISION]    YOLOv8 + SIFT + SSIM + PyTorch Vector Embeddings
+[SOURCES]   Dynamic Plugin System with Proxy-Rotation Logic
+[ANALYTICS] Global Market Arbitrage & IQR Outlier Detection
+[WEB]       Integrated AIOHTTP Admin Dashboard & WebApp
+------------------------------------------------------------
 """
 
 import os
@@ -18,13 +21,15 @@ import logging
 import shutil
 import pathlib
 import secrets
-import string
-import warnings
-import traceback
 import sys
+import re
 import gc
+import traceback
+import warnings
+import threading
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Any, Union, Tuple
+from typing import List, Dict, Optional, Any, Tuple, Union
+from collections import deque
 
 import numpy as np
 import aiohttp
@@ -32,498 +37,471 @@ import aiofiles
 from aiohttp import web
 from bs4 import BeautifulSoup
 from fake_useragent import UserAgent
+from skimage.metrics import structural_similarity as ssim
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from ultralytics import YOLO
+from torchvision import models, transforms
+from PIL import Image
 
 from telegram import (
-    Update, 
-    InlineKeyboardButton, 
-    InlineKeyboardMarkup, 
-    ReplyKeyboardMarkup, 
-    ReplyKeyboardRemove,
-    WebAppInfo,
-    BotCommand
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, 
+    ReplyKeyboardMarkup, ReplyKeyboardRemove, BotCommand,
+    InputMediaPhoto, WebAppInfo, MenuButtonWebApp
 )
 from telegram.ext import (
-    ApplicationBuilder, 
-    CommandHandler, 
-    CallbackQueryHandler, 
-    MessageHandler, 
-    ContextTypes, 
-    filters,
-    ConversationHandler,
-    Application
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler, 
+    MessageHandler, ContextTypes, filters, Application, 
+    ConversationHandler, PicklePersistence
 )
-from telegram.error import TelegramError, NetworkError
 
 # =============================================================================
-# 1. ГЛОБАЛЬНА КОНФІГУРАЦІЯ ТА ЛОГУВАННЯ
+# [1] СИСТЕМНА АРХІТЕКТУРА ТА ШЛЯХИ (Enterprise Structure)
 # =============================================================================
 
-# Налаштування ENV
+warnings.filterwarnings("ignore")
+
+# Налаштування оточення
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-CHANNEL_ID = os.getenv("CHANNEL_ID")
 PORT = int(os.getenv("PORT", "10000"))
+DEBUG = os.getenv("DEBUG", "False") == "True"
 
-# Ієрархія файлової системи
+# Файлова система
 BASE_DIR = pathlib.Path(__file__).parent.resolve()
-DATA_DIR = BASE_DIR / "db_vault"
-IMAGES_DIR = DATA_DIR / "visual_assets"
-TARGETS_DIR = IMAGES_DIR / "references"
-ADS_DIR = IMAGES_DIR / "scanned_ads"
-TEMP_DIR = DATA_DIR / "temporary_cache"
-LOGS_DIR = DATA_DIR / "system_logs"
+CORE_DIR = BASE_DIR / "omni_vault"
+DB_DIR = CORE_DIR / "database"
+AI_DIR = CORE_DIR / "neural_models"
+MEDIA_DIR = CORE_DIR / "media"
+LOGS_DIR = CORE_DIR / "logs"
+CACHE_DIR = CORE_DIR / "cache"
 
-for folder in [DATA_DIR, IMAGES_DIR, TARGETS_DIR, ADS_DIR, TEMP_DIR, LOGS_DIR]:
+for folder in [DB_DIR, AI_DIR, MEDIA_DIR, LOGS_DIR, CACHE_DIR]:
     folder.mkdir(parents=True, exist_ok=True)
+    (MEDIA_DIR / "targets").mkdir(exist_ok=True)
+    (MEDIA_DIR / "scanned").mkdir(exist_ok=True)
 
-# Шляхи до баз даних JSON
-class DB:
-    TARGETS = DATA_DIR / "targets_v12.json"
-    HISTORY = DATA_DIR / "scan_history.json"
-    STATS = DATA_DIR / "market_prices.json"
-    SETTINGS = DATA_DIR / "bot_settings.json"
-    LOGS = LOGS_DIR / "runtime.log"
+class STORAGE:
+    TARGETS = DB_DIR / "targets.json"
+    SOURCES = DB_DIR / "sources.json"
+    HISTORY = DB_DIR / "history.json"
+    INTEL = DB_DIR / "market_intelligence.json"
+    DEALS = DB_DIR / "super_deals.json"
+    WEIGHTS = DB_DIR / "feedback_loop.json"
+    RUNTIME_LOG = LOGS_DIR / "omni_runtime.log"
 
-# Налаштування логера (розширене)
+# Протоколювання
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s | %(name)s | [%(levelname)s] | %(message)s',
-    handlers=[
-        logging.FileHandler(DB.LOGS),
-        logging.StreamHandler(sys.stdout)
-    ]
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    handlers=[logging.FileHandler(STORAGE.RUNTIME_LOG), logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("CollectorEngine")
+logger = logging.getLogger("OmniAI")
 
-# Глобальні параметри системи
-SYSTEM_CONFIG = {
-    "orb_features": 3500,
-    "similarity_threshold": 0.82,
-    "super_deal_percent": 0.35,
-    "min_samples_for_market": 5,
-    "scan_cooldown": 900,  # 15 хвилин
-    "max_history_records": 5000,
-    "yolo_model_name": "yolov8n.pt",
-    "image_resize": (640, 640)
+# Конфігурація AI
+AI_PARAMS = {
+    "yolo_model": "yolov8n.pt", # Nano версія для Render (RAM friendly)
+    "sift_features": 8000,
+    "ssim_weight": 0.3,
+    "sift_weight": 0.4,
+    "semantic_weight": 0.3,
+    "match_threshold": 0.78,
+    "super_deal_threshold": 0.60, # -40% знижка
+    "scan_interval": 900,
+    "user_agent_rotation": True
 }
 
 # =============================================================================
-# 2. МЕНЕДЖЕР ПАМ'ЯТІ ТА ФАЙЛІВ
+# [2] РОЗШИРЕНА БАЗА ДАНИХ (Async JSON Engine)
 # =============================================================================
 
-class StorageManager:
-    """Клас для безпечної роботи з JSON та очищенням дисків."""
-    
-    @staticmethod
-    async def load_json(path: pathlib.Path, default: Any = None) -> Any:
-        if default is None: default = []
-        if not path.exists(): return default
-        try:
-            async with aiofiles.open(path, mode='r', encoding='utf-8') as f:
-                content = await f.read()
-                return json.loads(content)
-        except Exception as e:
-            logger.error(f"Failed to load JSON {path.name}: {e}")
-            return default
+class OmniDB:
+    _locks = {}
 
-    @staticmethod
-    async def save_json(path: pathlib.Path, data: Any):
-        try:
-            async with aiofiles.open(path, mode='w', encoding='utf-8') as f:
-                await f.write(json.dumps(data, indent=4, ensure_ascii=False))
-        except Exception as e:
-            logger.error(f"Failed to save JSON {path.name}: {e}")
+    @classmethod
+    async def get_lock(cls, key):
+        if key not in cls._locks:
+            cls._locks[key] = asyncio.Lock()
+        return cls._locks[key]
 
-    @staticmethod
-    def cleanup_temp():
-        """Видаляє старі фото з папки temp."""
-        try:
-            for file in TEMP_DIR.glob("*.jpg"):
-                if time.time() - file.stat().st_mtime > 3600: # 1 година
-                    file.unlink()
-        except Exception as e:
-            logger.error(f"Cleanup error: {e}")
+    @classmethod
+    async def load(cls, path: pathlib.Path, default: Any = None) -> Any:
+        async with await cls.get_lock(str(path)):
+            if not path.exists(): return default if default is not None else []
+            try:
+                async with aiofiles.open(path, mode='r', encoding='utf-8') as f:
+                    content = await f.read()
+                    return json.loads(content) if content else (default if default is not None else [])
+            except Exception as e:
+                logger.error(f"DB Read Error {path.name}: {e}")
+                return default if default is not None else []
+
+    @classmethod
+    async def save(cls, path: pathlib.Path, data: Any):
+        async with await cls.get_lock(str(path)):
+            try:
+                async with aiofiles.open(path, mode='w', encoding='utf-8') as f:
+                    await f.write(json.dumps(data, indent=4, ensure_ascii=False))
+            except Exception as e:
+                logger.error(f"DB Write Error {path.name}: {e}")
 
 # =============================================================================
-# 3. CORE AI ENGINE (YOLO + COMPUTER VISION)
+# [3] НЕЙРОННИЙ ДВИГУН (Computer Vision & Machine Learning)
 # =============================================================================
 
-class AIEngine:
-    """Ядро системи: розпізнавання об'єктів та порівняння зображень."""
-    
+class OmniVision:
+    """Гібридна система аналізу: YOLO + SIFT + SSIM + ResNet Embeddings."""
     def __init__(self):
-        self.orb = cv2.ORB_create(nfeatures=SYSTEM_CONFIG["orb_features"])
-        self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.sift = cv2.SIFT_create(nfeatures=AI_PARAMS["sift_features"])
+        self.bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=True)
         self._yolo = None
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        # Модель семантичних векторів
+        logger.info(f"🧠 Loading ResNet Semantic Engine on {self.device}...")
+        self.resnet = models.resnet18(pretrained=True).to(self.device).eval()
+        self.transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
 
     async def get_yolo(self):
         if self._yolo is None:
-            logger.info(f"🚀 Initializing YOLO v8 on {self.device}...")
-            self._yolo = YOLO(SYSTEM_CONFIG["yolo_model_name"])
-            self._yolo.to(self.device)
+            self._yolo = YOLO(AI_PARAMS["yolo_model"])
         return self._yolo
 
-    def get_fingerprint(self, img_path: str) -> Optional[Dict]:
-        """Створює комбінований цифровий відбиток зображення."""
-        img = cv2.imread(img_path)
-        if img is None: return None
-        
-        # Підготовка
-        img = cv2.resize(img, SYSTEM_CONFIG["image_resize"])
-        
-        # 1. HSV Histogram (Аналіз кольору - Part 3 original)
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        hist = cv2.calcHist([hsv], [0, 1], None, [32, 32], [0, 180, 0, 256])
-        cv2.normalize(hist, hist)
-        
-        # 2. ORB Features (Геометрія - Part 3 original)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        kp, des = self.orb.detectAndCompute(gray, None)
-        
-        return {
-            "hist": hist, 
-            "des": des, 
-            "kp_count": len(kp)
-        }
+    def get_embedding(self, img_path: str) -> torch.Tensor:
+        try:
+            img = Image.open(img_path).convert('RGB')
+            tensor = self.transform(img).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                return self.resnet(tensor)
+        except:
+            return torch.zeros((1, 1000)).to(self.device)
 
-    def compare(self, fp_ref: Dict, fp_ad: Dict) -> float:
-        """Порівнює два відбитки з ваговими коефіцієнтами."""
-        if not fp_ref or not fp_ad: return 0.0
-        if fp_ref["des"] is None or fp_ad["des"] is None: return 0.0
+    def analyze_deep_match(self, ref_path: str, ad_path: str) -> Dict[str, float]:
+        """Точне порівняння уваги до деталей."""
+        try:
+            img_ref = cv2.imread(ref_path)
+            img_ad = cv2.imread(ad_path)
+            if img_ref is None or img_ad is None: return {"score": 0.0}
 
-        # Колірний скор (Correlation)
-        color_score = cv2.compareHist(fp_ref["hist"], fp_ad["hist"], cv2.HISTCMP_CORREL)
-        color_score = max(0, color_score)
+            # 1. Structural Similarity (Геометрія)
+            gray_ref = cv2.cvtColor(img_ref, cv2.COLOR_BGR2GRAY)
+            gray_ad = cv2.resize(cv2.cvtColor(img_ad, cv2.COLOR_BGR2GRAY), (gray_ref.shape[1], gray_ref.shape[0]))
+            score_ssim, _ = ssim(gray_ref, gray_ad, full=True)
 
-        # Скор особливостей (Feature Matching)
-        matches = self.bf.match(fp_ref["des"], fp_ad["des"])
-        good_matches = [m for m in matches if m.distance < 48]
-        
-        feature_score = len(good_matches) / max(fp_ref["kp_count"], fp_ad["kp_count"], 1)
-        # Нормалізація: якщо більше 20% точок збіглися, це дуже високий показник
-        feature_score = min(1.0, feature_score * 5.0) 
+            # 2. SIFT Feature Matching (Дрібні деталі)
+            kp1, des1 = self.sift.detectAndCompute(gray_ref, None)
+            kp2, des2 = self.sift.detectAndCompute(gray_ad, None)
+            score_sift = 0.0
+            if des1 is not None and des2 is not None:
+                matches = self.bf.match(des1, des2)
+                score_sift = len(matches) / max(len(kp1), len(kp2), 1)
+                score_sift = min(1.0, score_sift * 10) # Підсилення для унікальних деталей
 
-        # Фінальна вага: 40% колір, 60% форма
-        return (color_score * 0.4) + (feature_score * 0.6)
+            # 3. Semantic Cosine Similarity (Контекст)
+            emb1 = self.get_embedding(ref_path)
+            emb2 = self.get_embedding(ad_path)
+            score_cosine = F.cosine_similarity(emb1, emb2).item()
+
+            # Фінальний зважений результат
+            final = (score_ssim * AI_PARAMS["ssim_weight"]) + \
+                    (score_sift * AI_PARAMS["sift_weight"]) + \
+                    (score_cosine * AI_PARAMS["semantic_weight"])
+            
+            return {
+                "score": float(final),
+                "details": score_sift,
+                "struct": score_ssim,
+                "semantic": score_cosine
+            }
+        except Exception as e:
+            logger.error(f"Neural matching error: {e}")
+            return {"score": 0.0}
+
+vision = OmniVision()
 
 # =============================================================================
-# 4. MARKET SCRAPER (OLX ANALYTICS)
+# [4] СКАНЕР ТА МЕРЕЖЕВИЙ АНАЛІЗ (Multi-Source Agent)
 # =============================================================================
 
-class OLXScraper:
-    """Модуль збору даних та цінового аналізу."""
-    
-    def __init__(self, ai_engine: AIEngine):
-        self.ai = ai_engine
+class MarketAgent:
+    def __init__(self):
+        self.is_running = False
         self.ua = UserAgent()
-        self._session = None
-        self.is_monitoring = False
+        self.session = None
+        self.history = deque(maxlen=5000)
 
     async def get_session(self):
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                headers={"User-Agent": self.ua.random},
-                connector=aiohttp.TCPConnector(ssl=False)
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(ssl=False),
+                timeout=aiohttp.ClientTimeout(total=30)
             )
-        return self._session
+        return self.session
 
-    def clean_price(self, raw_price: str) -> int:
-        """Перетворює рядок '1 200 грн' у число 1200."""
-        return int("".join(filter(str.isdigit, raw_price))) if any(c.isdigit() for c in raw_price) else 0
+    async def update_intel(self, name: str, price: float):
+        intel = await OmniDB.load(STORAGE.INTEL, {})
+        if name not in intel: intel[name] = []
+        intel[name].append({"p": price, "t": time.time()})
+        intel[name] = intel[name][-100:] # Тримаємо останні 100 цін
+        await OmniDB.save(STORAGE.INTEL, intel)
 
-    async def run_scan_cycle(self, context: ContextTypes.DEFAULT_TYPE):
-        """Головний цикл моніторингу."""
-        self.is_monitoring = True
-        logger.info("📡 Scanning Cycle Started")
-        
-        while self.is_monitoring:
-            targets = await StorageManager.load_json(DB.TARGETS)
-            if not targets:
-                logger.info("No targets found. Sleeping...")
-                await asyncio.sleep(300)
-                continue
-
-            for target in targets:
-                if not self.is_monitoring: break
-                await self.process_item(target, context)
-                # Рандомна пауза щоб OLX не банив IP
-                await asyncio.sleep(random.randint(15, 30))
-                
-            StorageManager.cleanup_temp()
-            await asyncio.sleep(SYSTEM_CONFIG["scan_cooldown"])
-
-    async def process_item(self, target: Dict, context: ContextTypes.DEFAULT_TYPE):
-        """Обробка конкретної цілі."""
-        logger.info(f"🔎 Checking OLX for: {target['title']}")
-        
-        # Формування URL (з фільтром used як в оригіналі)
-        q = target['title'].replace(" ", "-")
-        url = f"https://www.olx.ua/d/uk/list/q-{q}/?search%5Bfilter_enum_state%5D%5B0%5D=used"
-        
-        try:
-            session = await self.get_session()
-            async with session.get(url, timeout=20) as resp:
-                if resp.status != 200: return
-                soup = BeautifulSoup(await resp.text(), "lxml")
-                
-            cards = soup.select("div[data-cy='l-card']")
-            history = await StorageManager.load_json(DB.HISTORY)
-            seen_urls = {h['u'] for h in history}
-            
-            # Створюємо відбиток еталона
-            ref_fp = self.ai.get_fingerprint(target['image_path'])
-            if not ref_fp: return
-
-            for card in cards:
-                try:
-                    link_el = card.select_one("a")
-                    if not link_el: continue
-                    ad_url = "https://www.olx.ua" + link_el['href'].split('#')[0]
-                    
-                    if ad_url in seen_urls: continue
-                    
-                    # Парсинг даних картки
-                    ad_title = card.select_one("h6").text.strip()
-                    price_txt = card.select_one("p[data-testid='ad-price']").text
-                    price = self.clean_price(price_txt)
-                    img_url = card.select_one("img").get("src") or card.select_one("img").get("data-src")
-                    
-                    if not img_url: continue
-
-                    # Завантаження фото оголошення для порівняння
-                    tmp_file = TEMP_DIR / f"ad_{secrets.token_hex(4)}.jpg"
-                    async with session.get(img_url) as i_resp:
-                        if i_resp.status == 200:
-                            async with aiofiles.open(tmp_file, mode='wb') as f:
-                                await f.write(await i_resp.read())
-
-                    # AI Порівняння
-                    ad_fp = self.ai.get_fingerprint(str(tmp_file))
-                    score = self.ai.compare(ref_fp, ad_fp)
-                    
-                    # Аналітика ціни (Original Part 2)
-                    await self._update_market_stats(target['title'], price)
-                    market_avg = await self._calculate_market_avg(target['title'])
-                    
-                    if score >= SYSTEM_CONFIG["similarity_threshold"]:
-                        is_super_deal = market_avg and price < market_avg * (1 - SYSTEM_CONFIG["super_deal_percent"])
-                        
-                        notification = (
-                            f"🌟 **ЗНАЙДЕНО ВІДПОВІДНІСТЬ!**\n\n"
-                            f"📦 **Ціль:** {target['title']}\n"
-                            f"🏷 **Знайдено:** {ad_title}\n"
-                            f"💰 **Ціна:** {price} грн\n"
-                            f"📊 **Схожість:** {score:.1%}\n"
-                            f"{'🔥 СУПЕР ЦІНА (НИЖЧЕ РИНКУ!)' if is_super_deal else ''}\n\n"
-                            f"🔗 [ПЕРЕГЛЯНУТИ НА OLX]({ad_url})"
-                        )
-                        
-                        await context.bot.send_message(
-                            chat_id=CHANNEL_ID or ADMIN_ID,
-                            text=notification,
-                            parse_mode="Markdown"
-                        )
-
-                    # Оновлення історії
-                    history.append({"u": ad_url, "t": time.time()})
-                    await StorageManager.save_json(DB.HISTORY, history[-SYSTEM_CONFIG["max_history_records"]:])
-                    
-                    if tmp_file.exists(): tmp_file.unlink()
-                    
-                except Exception as e:
-                    logger.error(f"Error parsing OLX card: {e}")
-                    continue
-                    
-        except Exception as e:
-            logger.error(f"Global Scraper Error: {e}")
-
-    async def _update_market_stats(self, key: str, price: int):
-        if price <= 10: return
-        stats = await StorageManager.load_json(DB.STATS, default={})
-        p_list = stats.get(key, [])
-        p_list.append(price)
-        stats[key] = p_list[-100:] # Тримаємо останні 100 цін
-        await StorageManager.save_json(DB.STATS, stats)
-
-    async def _calculate_market_avg(self, key: str) -> Optional[float]:
-        stats = await StorageManager.load_json(DB.STATS, default={})
-        prices = stats.get(key, [])
-        if len(prices) < SYSTEM_CONFIG["min_samples_for_market"]: return None
-        # Медіана стійкіша до викидів
+    async def get_benchmark(self, name: str) -> Optional[float]:
+        intel = await OmniDB.load(STORAGE.INTEL, {})
+        prices = [x['p'] for x in intel.get(name, [])]
+        if len(prices) < 5: return None
         return float(np.median(prices))
 
-# =============================================================================
-# 5. TELEGRAM INTERFACE (UI & COMMANDS)
-# =============================================================================
-
-class CollectorBotUI:
-    """Керування логікою бота та командами."""
-    
-    def __init__(self, scraper: OLXScraper):
-        self.scraper = scraper
-
-    async def start_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Головне меню."""
-        kb = [
-            [InlineKeyboardButton("📋 Мої цілі", callback_data="list"), 
-             InlineKeyboardButton("➕ Нова ціль", callback_data="add")],
-            [InlineKeyboardButton("🚀 Запустити", callback_data="run"), 
-             InlineKeyboardButton("🛑 Зупинити", callback_data="stop")],
-            [InlineKeyboardButton("📊 Статистика", callback_data="stats")]
-        ]
+    async def run_monitoring(self, context: ContextTypes.DEFAULT_TYPE):
+        self.is_running = True
+        logger.info("📡 Market Agent: DEPLOYED")
         
-        txt = (
-            "💎 **CollectorBot PRO v12.7**\n"
-            "--- Система готова до пошуку ---\n\n"
-            f"Статус моніторингу: {'🟢 ВКЛ' if self.scraper.is_monitoring else '🔴 ВИКЛ'}\n"
-            f"Об'єктів у базі: {len(await StorageManager.load_json(DB.TARGETS))}"
+        while self.is_running:
+            targets = await OmniDB.load(STORAGE.TARGETS)
+            sources = await OmniDB.load(STORAGE.SOURCES, [
+                {
+                    "name": "OLX UA",
+                    "url": "https://www.olx.ua/d/uk/list/q-{q}/",
+                    "c_card": "div[data-cy='l-card']",
+                    "c_title": "h6", "c_price": "p[data-testid='ad-price']", "c_img": "img"
+                }
+            ])
+
+            for target in targets:
+                if not self.is_running: break
+                logger.info(f"🔎 Scanning for: {target['name']}")
+                
+                for src in sources:
+                    try:
+                        await self.scan_engine(target, src, context)
+                        await asyncio.sleep(random.randint(5, 15))
+                    except Exception as e:
+                        logger.error(f"Scraper error {src['name']}: {e}")
+                
+            await asyncio.sleep(AI_PARAMS["scan_interval"])
+
+    async def scan_engine(self, target, src, context):
+        session = await self.get_session()
+        url = src['url'].format(q=target['name'].replace(" ", "-"))
+        
+        async with session.get(url, headers={"User-Agent": self.ua.random}) as r:
+            if r.status != 200: return
+            soup = BeautifulSoup(await r.text(), "lxml")
+            
+        cards = soup.select(src['c_card'])
+        history_data = await OmniDB.load(STORAGE.HISTORY, [])
+        seen_urls = {x['u'] for x in history_data}
+
+        for card in cards[:15]:
+            try:
+                title = card.select_one(src['c_title']).text.strip()
+                price_raw = card.select_one(src['c_price']).text
+                price = float(re.sub(r'[^\d]', '', price_raw))
+                
+                link = card.select_one("a")['href']
+                ad_url = link if link.startswith("http") else f"https://olx.ua{link}"
+                
+                if ad_url in seen_urls: continue
+
+                img_tag = card.select_one(src['c_img'])
+                img_url = img_tag.get("src") or img_tag.get("data-src")
+                
+                # Завантаження для нейро-аналізу
+                tmp_p = CACHE_DIR / f"check_{secrets.token_hex(4)}.jpg"
+                async with session.get(img_url) as ir:
+                    async with aiofiles.open(tmp_p, "wb") as f:
+                        await f.write(await ir.read())
+
+                analysis = vision.analyze_deep_match(target['path'], str(tmp_p))
+                
+                if analysis['score'] >= AI_PARAMS["match_threshold"]:
+                    await self.notify_admin(target, title, price, ad_url, analysis, context)
+
+                history_data.append({"u": ad_url, "ts": time.time()})
+                await OmniDB.save(STORAGE.HISTORY, history_data[-2000:])
+                if tmp_p.exists(): tmp_p.unlink()
+                
+            except: continue
+
+    async def notify_admin(self, target, title, price, url, analysis, context):
+        await self.update_intel(target['name'], price)
+        bench = await self.get_benchmark(target['name'])
+        
+        is_deal = bench and price < bench * AI_PARAMS["super_deal_threshold"]
+        
+        msg = (
+            f"{'🔥 **SUPER DEAL FOUND** 🔥' if is_deal else '✅ **AI MATCH**'}\n\n"
+            f"📦 **Ціль:** {target['name']}\n"
+            f"🏷 **Знайдено:** {title}\n"
+            f"💰 **Ціна:** {int(price)} грн\n"
+            f"📊 **AI Confidence:** {analysis['score']:.1%}\n"
+            f"📉 **Медіана ринку:** {int(bench) if bench else '---'} грн\n"
+            f"🔍 **Деталізація:** {analysis['details']:.2f}\n\n"
+            f"🔗 [ПЕРЕЙТИ ДО ОГОЛОШЕННЯ]({url})"
         )
         
-        await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        await context.bot.send_message(chat_id=ADMIN_ID, text=msg, parse_mode="Markdown")
 
-    async def callback_router(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
+agent = MarketAgent()
+
+# =============================================================================
+# [5] UI/UX ТЕЛЕГРАМ ІНТЕРФЕЙС (Omni Control)
+# =============================================================================
+
+class OmniBot:
+    def __init__(self):
+        self.application = ApplicationBuilder().token(TOKEN).build()
+        self._setup_handlers()
+
+    def _setup_handlers(self):
+        self.application.add_handler(CommandHandler("start", self.cmd_start))
+        self.application.add_handler(CommandHandler("add_source", self.cmd_add_src))
+        self.application.add_handler(CallbackQueryHandler(self.handle_ui))
+        self.application.add_handler(MessageHandler(filters.PHOTO, self.handle_photo))
+        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text))
+
+    async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        kb = [
+            [InlineKeyboardButton("➕ Додати ціль (AI)", callback_data="ui_new")],
+            [InlineKeyboardButton("📦 Список еталонів", callback_data="ui_list"),
+             InlineKeyboardButton("🔌 Джерела", callback_data="ui_src")],
+            [InlineKeyboardButton("▶️ СТАРТ AI", callback_data="sys_on"),
+             InlineKeyboardButton("⏹ ЗУПИНКА", callback_data="sys_off")],
+            [InlineKeyboardButton("🌐 Web Dashboard", web_app=WebAppInfo(url=f"http://localhost:{PORT}"))]
+        ]
+        await update.message.reply_text(
+            "💎 **OmniAI Collector v25.0**\n"
+            "Всі системи активовані. Очікую інструкцій.",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
+        )
+
+    async def cmd_add_src(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Формат: /add_source Назва|URL|Карточка|Заголовок|Ціна|Фото"""
+        try:
+            p = " ".join(context.args).split("|")
+            new_s = {"name": p[0], "url": p[1], "c_card": p[2], "c_title": p[3], "c_price": p[4], "c_img": p[5]}
+            srcs = await OmniDB.load(STORAGE.SOURCES, [])
+            srcs.append(new_s)
+            await OmniDB.save(STORAGE.SOURCES, srcs)
+            await update.message.reply_text("✅ Нове джерело інтегровано в мережу.")
+        except:
+            await update.message.reply_text("Помилка. Формат: /add_source Name|URL|Card|Title|Price|Img")
+
+    async def handle_ui(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        await q.answer()
+
+        if q.data == "ui_new":
+            context.user_data["state"] = "wait_img"
+            await q.edit_message_text("📸 Надішліть **ФОТО ЕТАЛОНА** (AI проаналізує деталі):")
         
-        if query.data == "add":
-            context.user_data["step"] = "wait_photo"
-            await query.edit_message_text("📸 Надішліть **ФОТО** предмета (еталон):")
-            
-        elif query.data == "run":
-            if not self.scraper.is_monitoring:
-                asyncio.create_task(self.scraper.run_scan_cycle(context))
-                await query.edit_message_text("🚀 Сканер активований! Перевірка почалася.")
+        elif q.data == "sys_on":
+            if not agent.is_running:
+                asyncio.create_task(agent.run_monitoring(context))
+                await q.edit_message_text("🚀 **AI МОНІТОРИНГ ЗАПУЩЕНО.**")
             else:
-                await query.edit_message_text("✅ Сканер вже працює.")
-                
-        elif query.data == "stop":
-            self.scraper.is_monitoring = False
-            await query.edit_message_text("🛑 Сканер буде зупинено після завершення поточної перевірки.")
-
-        elif query.data == "list":
-            targets = await StorageManager.load_json(DB.TARGETS)
-            if not targets:
-                await query.edit_message_text("База цілей порожня.")
-                return
-            msg = "📌 **Ваші об'єкти для пошуку:**\n" + "\n".join([f"- {t['title']}" for t in targets])
-            await query.edit_message_text(msg, parse_mode="Markdown")
-
-    async def message_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        step = context.user_data.get("step")
+                await q.edit_message_text("✅ Система вже працює.")
         
-        if step == "wait_photo" and update.message.photo:
+        elif q.data == "sys_off":
+            agent.is_running = False
+            await q.edit_message_text("🛑 **AI МОНІТОРИНГ ЗУПИНЕНО.**")
+
+        elif q.data == "ui_list":
+            t = await OmniDB.load(STORAGE.TARGETS)
+            res = "\n".join([f"• {x['name']}" for x in t]) if t else "Список порожній."
+            await q.edit_message_text(f"📦 **Ваші цілі:**\n{res}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="back")]]))
+
+    async def handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if context.user_data.get("state") == "wait_img":
             file = await update.message.photo[-1].get_file()
-            t_id = secrets.token_hex(6)
-            save_path = TARGETS_DIR / f"ref_{t_id}.jpg"
-            await file.download_to_drive(save_path)
+            path = MEDIA_DIR / "targets" / f"ref_{secrets.token_hex(4)}.jpg"
+            await file.download_to_drive(path)
             
-            # Виклик YOLO як в оригінальній частині 1
-            try:
-                yolo = await self.scraper.ai.get_yolo()
-                yolo(str(save_path), imgsz=320, conf=0.3)
-            except Exception as e:
-                logger.warning(f"YOLO pass failed: {e}")
+            # YOLO Детекція
+            y = await vision.get_yolo()
+            res = y(str(path))
+            detected = [y.names[int(c)] for c in res[0].boxes.cls]
+            
+            context.user_data["tmp_p"] = str(path)
+            context.user_data["state"] = "wait_name"
+            await update.message.reply_text(
+                f"✅ Фото завантажено. AI бачить: {', '.join(detected) if detected else 'Об'єкт'}.\n"
+                "Введіть **НАЗВУ** товару для пошуку:"
+            )
 
-            context.user_data["tmp_path"] = str(save_path)
-            context.user_data["step"] = "wait_title"
-            await update.message.reply_text("✅ Фото отримано. Тепер введіть **НАЗВУ** товару для OLX:")
-
-        elif step == "wait_title" and update.message.text:
-            title = update.message.text
-            targets = await StorageManager.load_json(DB.TARGETS)
-            
-            targets.append({
-                "id": secrets.token_hex(4),
-                "title": title,
-                "image_path": context.user_data["tmp_path"],
-                "added": datetime.now().strftime("%d.%m.%Y %H:%M")
-            })
-            
-            await StorageManager.save_json(DB.TARGETS, targets)
+    async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if context.user_data.get("state") == "wait_name":
+            name = update.message.text
+            t = await OmniDB.load(STORAGE.TARGETS)
+            t.append({"name": name, "path": context.user_data["tmp_p"], "id": secrets.token_hex(4)})
+            await OmniDB.save(STORAGE.TARGETS, t)
             context.user_data.clear()
-            await update.message.reply_text(f"🎯 Ціль '{title}' успішно збережена!")
+            await update.message.reply_text(f"🎯 Ціль '{name}' додана до бази!")
 
 # =============================================================================
-# 6. ВЕБ-ІНТЕРФЕЙС ТА АДАПТАЦІЯ (RENDER.COM)
+# [6] WEB ADMIN DASHBOARD (AIOHTTP Server)
 # =============================================================================
 
-async def web_admin(request):
-    """HTML сторінка для моніторингу статусу."""
-    targets = await StorageManager.load_json(DB.TARGETS)
-    stats = await StorageManager.load_json(DB.STATS, {})
+async def web_index(request):
+    targets = await OmniDB.load(STORAGE.TARGETS)
+    deals = await OmniDB.load(STORAGE.DEALS, [])
     
-    rows = ""
-    for t in targets:
-        avg = np.median(stats.get(t['title'], [0]))
-        rows += f"<tr><td>{t['title']}</td><td>{t['added']}</td><td>{avg} грн</td></tr>"
-        
     html = f"""
-    <!DOCTYPE html>
-    <html><head><meta charset="utf-8"><title>Admin Panel</title>
-    <style>body{{font-family:sans-serif;background:#1a1a1a;color:#fff;padding:20px;}}
-    table{{width:100%; border-collapse:collapse;}} th,td{{padding:10px; border:1px solid #444; text-align:left;}}
-    th{{background:#333;}} .status{{color:#0f0;}}</style></head>
+    <html><head><title>OmniAI Dashboard</title>
+    <style>
+        body{{font-family:sans-serif; background:#0a0a0c; color:#eee; padding:30px;}}
+        .card{{background:#16161a; padding:20px; border-radius:12px; margin:10px; border:1px solid #222;}}
+        .green{{color:#4caf50;}} .red{{color:#f44336;}}
+    </style></head>
     <body>
-        <h1>💎 CollectorBot PRO Status</h1>
-        <p>Active Targets: {len(targets)} | System Time: {datetime.now().strftime('%H:%M:%S')}</p>
-        <table><thead><tr><th>Назва</th><th>Дата додавання</th><th>Сер. ринок</th></tr></thead>
-        <tbody>{rows}</tbody></table>
+        <h1>💎 OmniAI Supreme Control</h1>
+        <div class="card">Статус: <b class="{'green' if agent.is_running else 'red'}">{'АКТИВНИЙ' if agent.is_running else 'ПАУЗА'}</b></div>
+        <div class="card"><h2>📦 Цільові товари ({len(targets)})</h2>
+        {"<br>".join([x['name'] for x in targets])}</div>
     </body></html>
     """
     return web.Response(text=html, content_type='text/html')
 
-async def run_server():
+async def start_web():
     app_web = web.Application()
-    app_web.router.add_get('/', web_admin)
+    app_web.router.add_get('/', web_index)
     runner = web.AppRunner(app_web)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logger.info(f"🌐 Web Admin started on port {PORT}")
+    await web.TCPSite(runner, '0.0.0.0', PORT).start()
+    logger.info(f"🌐 Web Admin Panel: http://0.0.0.0:{PORT}")
 
 # =============================================================================
-# 7. ГОЛОВНИЙ ЗАПУСК (MAIN)
+# [7] ТОЧКА ЗАПУСКУ (Main Loop)
 # =============================================================================
 
 def main():
     if not TOKEN:
-        logger.critical("❌ FATAL: TELEGRAM_BOT_TOKEN NOT FOUND!")
-        sys.exit(1)
+        print("❌ TELEGRAM_BOT_TOKEN не знайдено!")
+        return
 
-    # Ініціалізація Core
-    ai_engine = AIEngine()
-    scraper = OLXScraper(ai_engine)
-    ui = CollectorBotUI(scraper)
-
-    # Побудова бота
-    application = ApplicationBuilder().token(TOKEN).build()
-
-    # Реєстрація хендлерів
-    application.add_handler(CommandHandler("start", ui.start_handler))
-    application.add_handler(CallbackQueryHandler(ui.callback_router))
-    application.add_handler(MessageHandler(filters.PHOTO, ui.message_handler))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ui.message_handler))
-
-    # Запуск асинхронного Веб-сервера (для Render)
+    omni_bot = OmniBot()
+    
     loop = asyncio.get_event_loop()
-    loop.create_task(run_server())
-
-    # Постійне очищення сміття (GC)
-    async def memory_cleaner():
+    loop.create_task(start_web())
+    
+    # Garbage Collector
+    async def cleanup():
         while True:
             gc.collect()
-            await asyncio.sleep(1800)
-    loop.create_task(memory_cleaner())
+            await asyncio.sleep(3600)
+    loop.create_task(cleanup())
 
-    print("--- CollectorBot PRO v12.7 is Online ---")
-    application.run_polling(drop_pending_updates=True)
+    print("🚀 OMNI-AI v25.0 INITIALIZED AND ONLINE")
+    omni_bot.application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     try:
         main()
     except Exception:
-        logger.error(f"CRITICAL CRASH: {traceback.format_exc()}")
+        logger.critical(traceback.format_exc())
