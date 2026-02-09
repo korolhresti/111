@@ -1,24 +1,23 @@
-# ============================================================
-# CollectorBot PRO v12 FINAL — PART 1 / 3
-# Python 3.13 — Render Ready — Single-file (split for deploy)
-# ============================================================
-
 import os
 import cv2
 import json
 import time
 import asyncio
-import signal
 import random
 import hashlib
 import logging
+import shutil
+import pathlib
+import secrets
+import string
+import warnings
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Optional, Any
 
 import numpy as np
 import aiohttp
+import aiofiles
 from aiohttp import web
-
 from bs4 import BeautifulSoup
 from fake_useragent import UserAgent
 
@@ -26,543 +25,403 @@ import torch
 from ultralytics import YOLO
 
 from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
+    Update, 
+    InlineKeyboardButton, 
+    InlineKeyboardMarkup, 
+    ReplyKeyboardMarkup, 
+    ReplyKeyboardRemove,
+    WebAppInfo
 )
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
+    ApplicationBuilder, 
+    CommandHandler, 
+    CallbackQueryHandler, 
+    MessageHandler, 
+    ContextTypes, 
     filters,
+    ConversationManager
 )
 
-# =========================
-# ENV / CONFIG
-# =========================
+# Вимикаємо зайві попередження
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# =============================================================================
+# 1. КОНФІГУРАЦІЯ ТА ГЛОБАЛЬНІ НАЛАШТУВАННЯ
+# =============================================================================
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 PORT = int(os.getenv("PORT", "10000"))
 
-if not TOKEN or not ADMIN_ID:
-    raise RuntimeError("ENV NOT SET")
+BASE_DIR = pathlib.Path(__file__).parent.resolve()
+DATA_DIR = BASE_DIR / "data"
+IMAGES_DIR = DATA_DIR / "images"
+TARGETS_DIR = IMAGES_DIR / "targets"
+TEMP_DIR = DATA_DIR / "temp"
 
-BASE_DIR = os.getcwd()
-DATA_DIR = os.path.join(BASE_DIR, "data")
-IMG_DIR = os.path.join(DATA_DIR, "images")
-EMB_DIR = os.path.join(DATA_DIR, "embeddings")
+# Створення ієрархії папок
+for folder in [DATA_DIR, IMAGES_DIR, TARGETS_DIR, TEMP_DIR]:
+    folder.mkdir(parents=True, exist_ok=True)
 
-for d in (DATA_DIR, IMG_DIR, EMB_DIR):
-    os.makedirs(d, exist_ok=True)
+# Файли бази даних
+DB_TARGETS = DATA_DIR / "targets.json"
+DB_HISTORY = DATA_DIR / "history.json"
+DB_STATS = DATA_DIR / "price_stats.json"
+DB_DEALS = DATA_DIR / "super_deals.json"
+DB_SETTINGS = DATA_DIR / "settings.json"
 
-TARGETS_FILE = os.path.join(DATA_DIR, "targets.json")
-HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
-PRICE_STATS_FILE = os.path.join(DATA_DIR, "price_stats.json")
-SUPER_DEALS_FILE = os.path.join(DATA_DIR, "super_deals.json")
-
-SIMILARITY_THRESHOLD = 0.80
+# Константи алгоритмів
+SIMILARITY_THRESHOLD = 0.82
+ORB_FEATURES = 2000
 SUPER_DEAL_DISCOUNT = 0.35
-MIN_HISTORY_SAMPLES = 5
-
-# =========================
-# LOGGING
-# =========================
+MIN_HISTORY_FOR_STATS = 5
+SCAN_INTERVAL = 600  # 10 хвилин
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
 )
-log = logging.getLogger("CollectorBot")
-
-# =========================
-# GLOBAL STATE
-# =========================
-
-MONITOR_RUNNING = False
-MONITOR_TASK = None
-WAIT_PHOTO = set()
-WAIT_DELETE = set()
-
-# =========================
-# UTILS
-# =========================
-
-def load_json(path, default):
-    if not os.path.exists(path):
-        return default
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-def sha256_file(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        h.update(f.read())
-    return h.hexdigest()
-
-def now():
-    return int(time.time())
-
-def cosine(a, b):
-    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-6))
-
-def save_image_bytes(data: bytes):
-    name = f"{now()}_{random.randint(1000,9999)}.jpg"
-    path = os.path.join(IMG_DIR, name)
-    with open(path, "wb") as f:
-        f.write(data)
-    return path
-
-def embed_image(path):
-    img = cv2.imread(path)
-    img = cv2.resize(img, (128, 128))
-    return img.mean(axis=(0, 1))
-
-# =========================
-# TARGET MANAGEMENT
-# =========================
-
-def load_targets():
-    return load_json(TARGETS_FILE, [])
-
-def save_targets(t):
-    save_json(TARGETS_FILE, t)
-
-def add_target(image_path, title="Manual Item"):
-    targets = load_targets()
-    tid = sha256_file(image_path)
-    emb = embed_image(image_path)
-    emb_path = os.path.join(EMB_DIR, f"{tid}.npy")
-    np.save(emb_path, emb)
-
-    targets.append({
-        "id": tid,
-        "title": title,
-        "image": image_path,
-        "embedding": emb_path,
-        "created": datetime.utcnow().isoformat()
-    })
-    save_targets(targets)
-
-def delete_target_by_keyword(keyword):
-    targets = load_targets()
-    before = len(targets)
-    targets = [
-        t for t in targets
-        if keyword.lower() not in t["id"].lower()
-        and keyword.lower() not in t["title"].lower()
-    ]
-    save_targets(targets)
-    return before - len(targets)
-
-# =========================
-# HISTORY / PRICE STATS
-# =========================
-
-def load_history():
-    return load_json(HISTORY_FILE, [])
-
-def save_history(h):
-    save_json(HISTORY_FILE, h)
-
-def load_price_stats():
-    return load_json(PRICE_STATS_FILE, {})
-
-def save_price_stats(p):
-    save_json(PRICE_STATS_FILE, p)
-
-def update_price_stats(title, price):
-    if not price:
-        return
-    stats = load_price_stats()
-    bucket = stats.setdefault(title, [])
-    bucket.append(price)
-    bucket[:] = bucket[-100:]
-    save_price_stats(stats)
-
-def avg_price(title):
-    stats = load_price_stats().get(title, [])
-    if len(stats) < MIN_HISTORY_SAMPLES:
-        return None
-    return sum(stats) / len(stats)
-
-# =========================
-# YOLO ENGINE
-# =========================
-
-YOLO_MODEL_NAME = "yolov8n.pt"
-YOLO_CONF = 0.35
-YOLO_IOU = 0.45
-
-yolo_model = None
-yolo_device = "cpu"
-
-def load_yolo():
-    global yolo_model, yolo_device
-    if yolo_model:
-        return
-    yolo_device = "cuda" if torch.cuda.is_available() else "cpu"
-    yolo_model = YOLO(YOLO_MODEL_NAME)
-    yolo_model.to(yolo_device)
-    log.info(f"YOLO loaded on {yolo_device}")
-
-def detect_objects(img_np):
-    load_yolo()
-    res = yolo_model(
-        img_np,
-        conf=YOLO_CONF,
-        iou=YOLO_IOU,
-        device=yolo_device,
-        verbose=False
-    )
-    boxes = []
-    for r in res:
-        if r.boxes:
-            for b in r.boxes.xyxy.cpu().numpy():
-                boxes.append(tuple(map(int, b)))
-    return boxes
-
-def extract_objects(img_np):
-    h, w, _ = img_np.shape
-    boxes = detect_objects(img_np)
-    crops = []
-    for x1, y1, x2, y2 in boxes:
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
-        crop = img_np[y1:y2, x1:x2]
-        if crop.size > 0:
-            crops.append(crop)
-    return crops if crops else [img_np]
-
-# =========================
-# CV ENGINE
-# =========================
-
-ORB = cv2.ORB_create(1500)
-
-def orb_score(a, b):
-    a = cv2.cvtColor(cv2.resize(a, (512, 512)), cv2.COLOR_BGR2GRAY)
-    b = cv2.cvtColor(cv2.resize(b, (512, 512)), cv2.COLOR_BGR2GRAY)
-    k1, d1 = ORB.detectAndCompute(a, None)
-    k2, d2 = ORB.detectAndCompute(b, None)
-    if d1 is None or d2 is None:
-        return 0.0
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-    m = bf.match(d1, d2)
-    good = [x for x in m if x.distance < 50]
-    return min(1.0, len(good) / max(len(k1), len(k2)))
-
-def hsv_score(a, b):
-    h1 = cv2.cvtColor(a, cv2.COLOR_BGR2HSV)
-    h2 = cv2.cvtColor(b, cv2.COLOR_BGR2HSV)
-    c1 = cv2.calcHist([h1], [0, 1], None, [50, 60], [0, 180, 0, 256])
-    c2 = cv2.calcHist([h2], [0, 1], None, [50, 60], [0, 180, 0, 256])
-    cv2.normalize(c1, c1)
-    cv2.normalize(c2, c2)
-    return max(0.0, min(1.0, cv2.compareHist(c1, c2, cv2.HISTCMP_CORREL)))
-
-def compare_images(path_a, path_b):
-    a = cv2.imread(path_a)
-    b = cv2.imread(path_b)
-    o = orb_score(a, b)
-    h = hsv_score(a, b)
-    return o * 0.65 + h * 0.35
-# ============================================================
-# CollectorBot PRO v12 FINAL — PART 2 / 3
-# ============================================================
-
-# =========================
-# NETWORK / SCRAPING
-# =========================
-
-UA = UserAgent()
-
-async def fetch(session, url):
-    await asyncio.sleep(random.uniform(1.2, 3.0))
-    headers = {"User-Agent": UA.random}
-    async with session.get(url, headers=headers, timeout=30) as r:
-        return await r.text()
-
-async def fetch_bytes(session, url):
-    await asyncio.sleep(random.uniform(1.2, 2.5))
-    headers = {"User-Agent": UA.random}
-    async with session.get(url, headers=headers, timeout=30) as r:
-        return await r.read()
-
-def parse_price(text):
-    try:
-        return int("".join([c for c in text if c.isdigit()]))
-    except:
-        return None
-
-# =========================
-# EMPRESS SYNC
-# =========================
-
-async def sync_empress():
-    url = "https://empress.cc/collections/all"
-    async with aiohttp.ClientSession() as session:
-        html = await fetch(session, url)
-        soup = BeautifulSoup(html, "lxml")
-
-        items = soup.select("div.product-item")
-        added = 0
-
-        for it in items:
-            title = it.select_one(".product-title")
-            price = it.select_one(".price")
-            img = it.select_one("img")
-
-            if not title or not img:
-                continue
-
-            img_url = img.get("src")
-            if not img_url.startswith("http"):
-                img_url = "https:" + img_url
-
-            data = await fetch_bytes(session, img_url)
-            img_path = save_image_bytes(data)
-            add_target(img_path, title.text.strip())
-            added += 1
-
-        return added
-
-# =========================
-# OLX SEARCH
-# =========================
-
-async def search_olx(query):
-    url = f"https://www.olx.ua/d/uk/list/q-{query.replace(' ', '-')}/"
-    async with aiohttp.ClientSession() as session:
-        html = await fetch(session, url)
-        soup = BeautifulSoup(html, "lxml")
-
-        ads = []
-        for card in soup.select("div[data-cy='l-card']"):
-            if card.select_one("[data-testid='adCard-featured']"):
-                continue
-
-            link = card.select_one("a")
-            title = card.select_one("h6")
-            price = card.select_one("p[data-testid='ad-price']")
-            img = card.select_one("img")
-
-            if not link or not img:
-                continue
-
-            ads.append({
-                "title": title.text.strip() if title else "",
-                "price": parse_price(price.text) if price else None,
-                "url": "https://www.olx.ua" + link["href"],
-                "image": img.get("src")
-            })
-
-        return ads
-
-# =========================
-# MATCH ENGINE
-# =========================
-
-async def process_target(target):
-    history = load_history()
-    seen = {h["url"] for h in history}
-
-    ads = await search_olx(target["title"] + " б.у")
-
-    async with aiohttp.ClientSession() as session:
-        for ad in ads:
-            if ad["url"] in seen:
-                continue
-
-            img_data = await fetch_bytes(session, ad["image"])
-            img_path = save_image_bytes(img_data)
-
-            score = compare_images(target["image"], img_path)
-            update_price_stats(target["title"], ad["price"])
-
-            history.append({
-                "url": ad["url"],
-                "score": score,
-                "time": now()
-            })
-            save_history(history)
-
-            if score >= SIMILARITY_THRESHOLD:
-                await send_match(target, ad, score)
-
-# =========================
-# SUPER DEAL DETECTOR
-# =========================
-
-async def send_match(target, ad, score):
-    avg = avg_price(target["title"])
-    deal = False
-
-    if avg and ad["price"]:
-        if ad["price"] < avg * (1 - SUPER_DEAL_DISCOUNT):
-            deal = True
-            deals = load_json(SUPER_DEALS_FILE, [])
-            deals.append({
-                "title": target["title"],
-                "price": ad["price"],
-                "avg": avg,
-                "url": ad["url"],
-                "time": now()
-            })
-            save_json(SUPER_DEALS_FILE, deals)
-
-    text = (
-        f"🚨 MATCH FOUND\n"
-        f"🎯 {target['title']}\n"
-        f"📦 {ad['title']}\n"
-        f"💵 {ad['price']} грн\n"
-        f"📊 Similarity: {score*100:.1f}%\n"
-        f"{'🔥 SUPER DEAL' if deal else ''}\n"
-        f"{ad['url']}"
-    )
-
-    await app.bot.send_message(chat_id=CHANNEL_ID or ADMIN_ID, text=text)
-
-# =========================
-# MONITOR LOOP
-# =========================
-
-async def monitor_loop():
-    global MONITOR_RUNNING
-    MONITOR_RUNNING = True
-    while MONITOR_RUNNING:
-        targets = load_targets()
-        random.shuffle(targets)
-        for t in targets[:5]:
-            await process_target(t)
-        await asyncio.sleep(300)
-# ============================================================
-# CollectorBot PRO v12 FINAL — PART 3 / 3
-# ============================================================
-
-# =========================
-# TELEGRAM COMMANDS
-# =========================
+logger = logging.getLogger("CollectorBotPRO")
+
+# =============================================================================
+# 2. МОДЕЛЬ ДАНИХ ТА СИСТЕМА ЗБЕРЕЖЕННЯ
+# =============================================================================
+
+class Database:
+    @staticmethod
+    def load(file_path: pathlib.Path, default: Any) -> Any:
+        if not file_path.exists():
+            return default
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Error loading {file_path}: {e}")
+            return default
+
+    @staticmethod
+    def save(file_path: pathlib.Path, data: Any):
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"Error saving {file_path}: {e}")
+
+# =============================================================================
+# 3. СИСТЕМА КОМП'ЮТЕРНОГО ЗОРУ (CV ENGINE)
+# =============================================================================
+
+class CVEngine:
+    def __init__(self):
+        self.orb = cv2.ORB_create(nfeatures=ORB_FEATURES)
+        self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        self.yolo = None
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    def load_yolo(self):
+        if self.yolo is None:
+            logger.info(f"Loading YOLOv8n on {self.device}...")
+            self.yolo = YOLO("yolov8n.pt")
+            self.yolo.to(self.device)
+        return self.yolo
+
+    def get_image_fingerprint(self, image_path: str):
+        img = cv2.imread(image_path)
+        if img is None: return None
+        
+        # 1. Колірна гістограма (HSV)
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist([hsv], [0, 1], None, [32, 32], [0, 180, 0, 256])
+        cv2.normalize(hist, hist)
+        
+        # 2. Ключові точки ORB
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        kp, des = self.orb.detectAndCompute(gray, None)
+        
+        return {"hist": hist, "des": des, "kp_len": len(kp)}
+
+    def compare(self, path1: str, path2: str) -> float:
+        f1 = self.get_image_fingerprint(path1)
+        f2 = self.get_image_fingerprint(path2)
+        
+        if not f1 or not f2 or f1["des"] is None or f2["des"] is None:
+            return 0.0
+
+        # Hist Score (30%)
+        hist_score = cv2.compareHist(f1["hist"], f2["hist"], cv2.HISTCMP_CORREL)
+        hist_score = max(0, hist_score)
+
+        # ORB Score (70%)
+        matches = self.bf.match(f1["des"], f2["des"])
+        matches = sorted(matches, key=lambda x: x.distance)
+        good_matches = [m for m in matches if m.distance < 40]
+        
+        orb_score = len(good_matches) / max(f1["kp_len"], f2["kp_len"], 1)
+        orb_score = min(1.0, orb_score * 5) # Підсилення сигналу
+
+        final_score = (hist_score * 0.3) + (orb_score * 0.7)
+        return float(final_score)
+
+engine = CVEngine()
+
+# =============================================================================
+# 4. МОДУЛЬ ПАРСИНГУ ТА МОНІТОРИНГУ
+# =============================================================================
+
+class OLXScanner:
+    def __init__(self):
+        self.ua = UserAgent()
+        self.running = False
+
+    async def get_page(self, session, url):
+        headers = {"User-Agent": self.ua.random}
+        async with session.get(url, headers=headers, timeout=20) as response:
+            if response.status == 200:
+                return await response.text()
+            return None
+
+    async def scan_item(self, target: Dict, context: ContextTypes.DEFAULT_TYPE):
+        query = target["title"].replace(" ", "-")
+        url = f"https://www.olx.ua/d/uk/list/q-{query}/?search%5Bfilter_enum_state%5D%5B0%5D=used"
+        
+        async with aiohttp.ClientSession() as session:
+            html = await self.get_page(session, url)
+            if not html: return
+
+            soup = BeautifulSoup(html, "lxml")
+            cards = soup.select("div[data-cy='l-card']")
+            
+            history = Database.load(DB_HISTORY, [])
+            seen_urls = {h['url'] for h in history}
+            
+            for card in cards:
+                try:
+                    link_el = card.select_one("a")
+                    if not link_el: continue
+                    ad_url = "https://www.olx.ua" + link_el['href'].split('#')[0]
+                    
+                    if ad_url in seen_urls: continue
+                    
+                    title = card.select_one("h6").text.strip()
+                    price_text = card.select_one("p[data-testid='ad-price']").text
+                    price = int("".join(filter(str.isdigit, price_text))) if any(c.isdigit() for c in price_text) else 0
+                    
+                    img_el = card.select_one("img")
+                    img_url = img_el.get("src") or img_el.get("data-src")
+                    
+                    if not img_url: continue
+
+                    # Завантаження та порівняння фото
+                    temp_path = TEMP_DIR / f"check_{secrets.token_hex(4)}.jpg"
+                    async with session.get(img_url) as img_resp:
+                        if img_resp.status == 200:
+                            content = await img_resp.read()
+                            async with aiofiles.open(temp_path, mode='wb') as f:
+                                await f.write(content)
+                    
+                    score = engine.compare(str(target["image_path"]), str(temp_path))
+                    
+                    # Оновлення статистики цін
+                    self._update_stats(target["title"], price)
+                    
+                    if score >= SIMILARITY_THRESHOLD:
+                        avg_p = self._get_avg(target["title"])
+                        deal_marker = ""
+                        if avg_p and price < avg_p * (1 - SUPER_DEAL_DISCOUNT):
+                            deal_marker = "\n🔥 **СУПЕР ЦІНА (DEAL)**"
+                        
+                        msg = (
+                            f"✅ **Знайдено збіг!** ({score:.2%})\n"
+                            f"📦 **Товар:** {title}\n"
+                            f"💰 **Ціна:** {price} грн\n"
+                            f"📊 **Сер. ціна:** {int(avg_p) if avg_p else '---'} грн{deal_marker}\n\n"
+                            f"🔗 [Переглянути оголошення]({ad_url})"
+                        )
+                        
+                        await context.bot.send_message(
+                            chat_id=CHANNEL_ID or ADMIN_ID,
+                            text=msg,
+                            parse_mode="Markdown"
+                        )
+                        
+                    history.append({"url": ad_url, "timestamp": time.time()})
+                    Database.save(DB_HISTORY, history[-1000:])
+                    if temp_path.exists(): temp_path.unlink()
+                    
+                except Exception as e:
+                    logger.error(f"Error parsing card: {e}")
+                await asyncio.sleep(1)
+
+    def _update_stats(self, title, price):
+        if price <= 0: return
+        stats = Database.load(DB_STATS, {})
+        data = stats.get(title, [])
+        data.append(price)
+        stats[title] = data[-100:]
+        Database.save(DB_STATS, stats)
+
+    def _get_avg(self, title):
+        stats = Database.load(DB_STATS, {}).get(title, [])
+        if len(stats) < MIN_HISTORY_FOR_STATS: return None
+        return sum(stats) / len(stats)
+
+scanner = OLXScanner()
+
+# =============================================================================
+# 5. TELEGRAM ІНТЕРФЕЙС (BOT LOGIC)
+# =============================================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [
-        [InlineKeyboardButton("➕ Додати еталон", callback_data="add")],
-        [InlineKeyboardButton("📦 Список еталонів", callback_data="list")],
-        [InlineKeyboardButton("▶️ Старт моніторингу", callback_data="run")],
-        [InlineKeyboardButton("⏹ Стоп моніторингу", callback_data="stop")],
-        [InlineKeyboardButton("🔥 Супер-угоди", callback_data="deals")],
-        [InlineKeyboardButton("🧠 YOLO детекція", callback_data="yolo")],
-        [InlineKeyboardButton("🌐 Web-Admin", callback_data="web")]
+    user = update.effective_user
+    logger.info(f"User {user.id} started the bot")
+    
+    keyboard = [
+        [InlineKeyboardButton("🔍 Мої цілі", callback_data="view_targets"), 
+         InlineKeyboardButton("➕ Додати нову", callback_data="add_new")],
+        [InlineKeyboardButton("📊 Статистика", callback_data="stats"),
+         InlineKeyboardButton("⚙️ Налаштування", callback_data="settings")],
+        [InlineKeyboardButton("▶️ Запустити сканер", callback_data="start_scan"),
+         InlineKeyboardButton("⏹ Зупинити", callback_data="stop_scan")]
     ]
-    await update.message.reply_text(
-        "CollectorBot PRO v12\nОберіть дію:",
-        reply_markup=InlineKeyboardMarkup(kb)
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    welcome_text = (
+        f"👋 Вітаю, {user.first_name}!\n\n"
+        f"Я — **CollectorBot PRO**.\n"
+        f"Я вмію шукати антикваріат та рідкісні речі на OLX за допомогою штучного інтелекту.\n\n"
+        f"Статус сканера: {'🟢 Активний' if scanner.running else '🔴 Зупинений'}"
     )
+    
+    await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode="Markdown")
 
-async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+async def button_tap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    await query.answer()
 
-    if q.data == "run":
-        asyncio.create_task(monitor_loop())
-        await q.edit_message_text("▶️ Моніторинг запущено")
+    if data == "add_new":
+        context.user_data["mode"] = "waiting_photo"
+        await query.edit_message_text("📸 Будь ласка, надішліть **ФОТО** предмета-еталона.")
+    
+    elif data == "start_scan":
+        if not scanner.running:
+            scanner.running = True
+            asyncio.create_task(background_monitor(context))
+            await query.edit_message_text("🚀 Сканер запущено! Перевірка кожні 10 хвилин.")
+        else:
+            await query.edit_message_text("✅ Сканер вже працює.")
+            
+    elif data == "stop_scan":
+        scanner.running = False
+        await query.edit_message_text("🛑 Сканер зупинено.")
 
-    elif q.data == "stop":
-        global MONITOR_RUNNING
-        MONITOR_RUNNING = False
-        await q.edit_message_text("⏹ Моніторинг зупинено")
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mode = context.user_data.get("mode")
+    
+    if mode == "waiting_photo" and update.message.photo:
+        photo_file = await update.message.photo[-1].get_file()
+        file_id = secrets.token_hex(8)
+        file_path = TARGETS_DIR / f"{file_id}.jpg"
+        await photo_file.download_to_drive(file_path)
+        
+        # Використання YOLO для пре-аналізу
+        try:
+            model = engine.load_yolo()
+            results = model(str(file_path))
+            # Можна додати логіку автоматичного іменування за класом YOLO
+        except: pass
 
-    elif q.data == "list":
-        targets = load_targets()
-        text = "\n".join([f"{i+1}. {t['title']}" for i, t in enumerate(targets)]) or "Порожньо"
-        await q.edit_message_text(text)
+        context.user_data["tmp_path"] = str(file_path)
+        context.user_data["mode"] = "waiting_title"
+        await update.message.reply_text("✅ Фото отримано! Тепер введіть **НАЗВУ** для пошуку на OLX:")
 
-    elif q.data == "deals":
-        deals = load_json(SUPER_DEALS_FILE, [])
-        if not deals:
-            await q.edit_message_text("Немає супер-угод")
-            return
-        txt = "\n\n".join([
-            f"{d['title']}\n💵 {d['price']} (avg {d['avg']})\n{d['url']}"
-            for d in deals[-5:]
-        ])
-        await q.edit_message_text(txt[:4000])
-
-    elif q.data == "web":
-        await q.edit_message_text(f"Web Admin: http://0.0.0.0:{WEB_PORT}")
-
-    elif q.data == "yolo":
-        await q.edit_message_text("YOLO активний (детекція при додаванні фото)")
-
-    elif q.data == "add":
-        context.user_data["wait_photo"] = True
-        await q.edit_message_text("Надішліть фото еталону")
-
-async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("wait_photo"):
-        return
-
-    file = await update.message.photo[-1].get_file()
-    path = os.path.join(IMG_DIR, f"user_{update.effective_user.id}_{now()}.jpg")
-    await file.download_to_drive(path)
-
-    context.user_data["wait_photo"] = False
-    context.user_data["photo_path"] = path
-    context.user_data["wait_title"] = True
-
-    await update.message.reply_text("Введіть назву еталону")
-
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("wait_title"):
+    elif mode == "waiting_title" and update.message.text:
         title = update.message.text
-        path = context.user_data.get("photo_path")
-        add_target(path, title)
+        targets = Database.load(DB_TARGETS, [])
+        
+        new_target = {
+            "id": secrets.token_hex(4),
+            "title": title,
+            "image_path": context.user_data["tmp_path"],
+            "created_at": datetime.now().isoformat()
+        }
+        
+        targets.append(new_target)
+        Database.save(DB_TARGETS, targets)
         context.user_data.clear()
-        await update.message.reply_text("✅ Еталон додано")
+        await update.message.reply_text(f"🥳 Цілі '{title}' успішно додана!")
 
-# =========================
-# WEB ADMIN (LOCAL)
-# =========================
+async def background_monitor(context):
+    while scanner.running:
+        logger.info("Starting global scan cycle...")
+        targets = Database.load(DB_TARGETS, [])
+        for t in targets:
+            if not scanner.running: break
+            await scanner.scan_item(t, context)
+        await asyncio.sleep(SCAN_INTERVAL)
 
-async def web_index(request):
-    targets = load_targets()
-    html = "<h1>CollectorBot Admin</h1><ul>"
+# =============================================================================
+# 6. WEB АДМІНІСТРУВАННЯ ТА СЕРВЕР
+# =============================================================================
+
+async def handle_web_root(request):
+    targets = Database.load(DB_TARGETS, [])
+    html = f"""
+    <html>
+        <head><title>CollectorBot Admin</title>
+        <style>body{{font-family:sans-serif; padding:20px; background:#f4f4f4;}}
+        .card{{background:#fff; padding:15px; margin:10px; border-radius:8px; box-shadow:0 2px 5px rgba(0,0,0,0.1);}}
+        img{{max-width:100px; border-radius:4px;}}</style></head>
+        <body>
+            <h1>💎 CollectorBot PRO Control Panel</h1>
+            <p>Статус сканера: {'<b style="color:green">ACTIVE</b>' if scanner.running else '<b style="color:red">OFFLINE</b>'}</p>
+            <h2>Активні цілі ({len(targets)})</h2>
+            <div style="display:flex; flex-wrap:wrap;">
+    """
     for t in targets:
-        html += f"<li>{t['title']}</li>"
-    html += "</ul>"
-    return web.Response(text=html, content_type="text/html")
+        html += f"""
+        <div class="card">
+            <h3>{t['title']}</h3>
+            <p>ID: {t['id']}</p>
+            <p>Додано: {t['created_at'][:10]}</p>
+        </div>
+        """
+    html += "</div></body></html>"
+    return web.Response(text=html, content_type='text/html')
 
-async def start_web():
-    appw = web.Application()
-    appw.router.add_get("/", web_index)
-    runner = web.AppRunner(appw)
+async def start_web_server():
+    app_web = web.Application()
+    app_web.router.add_get('/', handle_web_root)
+    runner = web.AppRunner(app_web)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", WEB_PORT)
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
+    logger.info(f"Web Admin Panel available on port {PORT}")
 
-# =========================
-# MAIN
-# =========================
+# =============================================================================
+# 7. ЗАПУСК
+# =============================================================================
 
 def main():
-    global app
-    app = ApplicationBuilder().token(TOKEN).build()
+    if not TOKEN:
+        print("Error: TELEGRAM_BOT_TOKEN not found!")
+        return
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(buttons))
-    app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    application = ApplicationBuilder().token(TOKEN).build()
 
-    asyncio.get_event_loop().create_task(start_web())
-    app.run_polling()
+    # Реєстрація обробників
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(button_tap))
+    application.add_handler(MessageHandler(filters.PHOTO | filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Запуск фонового веб-сервера
+    loop = asyncio.get_event_loop()
+    loop.create_task(start_web_server())
+
+    print("--- CollectorBot PRO Started ---")
+    application.run_polling()
 
 if __name__ == "__main__":
     main()
-    
