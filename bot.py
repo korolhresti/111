@@ -510,7 +510,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     file = await update.message.photo[-1].get_file()
-    path = f"{IMAGES_DIR}/user_{update.effective_user.id}_{now()}.jpg"
+    path = os.path.join(IMG_DIR, f"user_{update.effective_user.id}_{now()}.jpg")
     await file.download_to_drive(path)
 
     context.user_data["wait_photo"] = False
