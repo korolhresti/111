@@ -56,7 +56,7 @@ from telegram.ext import (
     MessageHandler, ContextTypes, filters, Application, 
     ConversationHandler, PicklePersistence
 )
-
+os.environ['YOLO_CONFIG_DIR'] = '/tmp/Ultralytics'
 # =============================================================================
 # [1] СИСТЕМНА АРХІТЕКТУРА ТА ШЛЯХИ (Enterprise Structure)
 # =============================================================================
@@ -78,10 +78,13 @@ MEDIA_DIR = CORE_DIR / "media"
 LOGS_DIR = CORE_DIR / "logs"
 CACHE_DIR = CORE_DIR / "cache"
 
-for folder in [DB_DIR, AI_DIR, MEDIA_DIR, LOGS_DIR, CACHE_DIR]:
+# --- ВИПРАВЛЕНИЙ БЛОК СТВОРЕННЯ ПАПОК ---
+for folder in [DB_DIR, MEDIA_DIR, LOGS_DIR, CACHE_DIR]:
+    # parents=True дозволяє створювати вкладені шляхи одночасно
     folder.mkdir(parents=True, exist_ok=True)
-    (MEDIA_DIR / "targets").mkdir(exist_ok=True)
-    (MEDIA_DIR / "scanned").mkdir(exist_ok=True)
+
+# Створення підпапки для таргетів тепер пройде успішно
+(MEDIA_DIR / "targets").mkdir(parents=True, exist_ok=True)
 
 class STORAGE:
     TARGETS = DB_DIR / "targets.json"
