@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+як# -*- coding: utf-8 -*-
 """
 💎 COLLECTOR BOT OMNI-AI v25.0 - ULTIMATE ENTERPRISE EDITION
 ------------------------------------------------------------
@@ -366,7 +366,7 @@ class OmniBot:
              InlineKeyboardButton("🔌 Джерела", callback_data="ui_src")],
             [InlineKeyboardButton("▶️ СТАРТ AI", callback_data="sys_on"),
              InlineKeyboardButton("⏹ ЗУПИНКА", callback_data="sys_off")],
-            [InlineKeyboardButton("🌐 Web Dashboard", web_app=WebAppInfo(url=f"https://dashboard.render.com/worker/srv-d5dfnnpr0fns73aid880/deploys/dep-d65eolkr85hc73e32qp0?r=2026-02-10%4008%3A28%3A10%7E2026-02-10%4008%3A41%3A48"))]
+            
         ]
         await update.message.reply_text(
             "💎 **OmniAI Collector v25.0**\n"
@@ -501,8 +501,8 @@ def main():
     print("🚀 OMNI-AI v25.0 INITIALIZED AND ONLINE")
     omni_bot.application.run_polling(drop_pending_updates=True)
 
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception:
-        logger.critical(traceback.format_exc())
+
+        if __name__ == "__main__":
+    # Параметр drop_pending_updates видаляє всі старі повідомлення, 
+    # які прийшли, поки бот був офлайн або конфліктував
+    application.run_polling(drop_pending_updates=True)
