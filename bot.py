@@ -399,7 +399,7 @@ class OmniBot:
             await q.edit_message_text(f"📦 **Ваші цілі:**\n{res}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="back")]]))
 
     async def handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if context.user_data.get("st") == "img":
+        if context.user_data.get("st") == "wait_img":
             file = await update.message.photo[-1].get_file()
             path = str(MEDIA_DIR / "targets" / f"ref_{secrets.token_hex(4)}.jpg")
             await file.download_to_drive(path)
