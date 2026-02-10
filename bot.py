@@ -491,6 +491,12 @@ def main():
 
 
 if __name__ == "__main__":
-    # Параметр drop_pending_updates видаляє всі старі повідомлення, 
-    # які прийшли, поки бот був офлайн або конфліктував
-    application.run_polling(drop_pending_updates=True)
+    try:
+        # ПЕРЕВІРТЕ: чи збігається назва 'application' з тією, 
+        # яку ви вказали вище при створенні Application.builder()
+        print("🚀 Бот запускається...")
+        application.run_polling(drop_pending_updates=True)
+    except NameError as e:
+        print(f"❌ Помилка назви: {e}. Перевірте, як названо об'єкт Application!")
+    except Exception as e:
+        print(f"💥 Критична помилка: {e}")
