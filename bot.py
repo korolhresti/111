@@ -379,7 +379,7 @@ class OmniBot:
         await q.answer()
 
         if q.data == "ui_new":
-            context.user_data["state"] = "wait_img"
+            context.user_data["state"] = "WAIT_IMG"
             await q.edit_message_text("📸 Надішліть **ФОТО ЕТАЛОНА** (AI проаналізує деталі):")
         
         elif q.data == "sys_on":
@@ -399,7 +399,7 @@ class OmniBot:
             await q.edit_message_text(f"📦 **Ваші цілі:**\n{res}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="back")]]))
 
     async def handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if context.user_data.get("st") == "wait_img":
+        if context.user_data.get("state") == "WAIT_IMG":
             file = await update.message.photo[-1].get_file()
             path = str(MEDIA_DIR / "targets" / f"ref_{secrets.token_hex(4)}.jpg")
             await file.download_to_drive(path)
