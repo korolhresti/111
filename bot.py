@@ -376,7 +376,7 @@ class OmniBot:
              InlineKeyboardButton("🔌 Джерела", callback_data="ui_src")],
             [InlineKeyboardButton("▶️ СТАРТ AI", callback_data="sys_on"),
              InlineKeyboardButton("⏹ ЗУПИНКА", callback_data="sys_off")],
-            [InlineKeyboardButton("🌐 Web Dashboard", web_app=WebAppInfo(url=f"http://localhost:{PORT}"))]
+            [InlineKeyboardButton("🌐 Web Dashboard", web_app=WebAppInfo(url=f"https://dashboard.render.com/worker/srv-d5dfnnpr0fns73aid880/deploys/dep-d65eolkr85hc73e32qp0?r=2026-02-10%4008%3A28%3A10%7E2026-02-10%4008%3A41%3A48"))]
         ]
         await update.message.reply_text(
             "💎 **OmniAI Collector v25.0**\n"
