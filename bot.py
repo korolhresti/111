@@ -415,7 +415,11 @@ class OmniBot:
             else:
                 ai_vision_text = "Обʼєкт"  # Використовуємо модифікований апостроф (U+02BC) або просто текст
             
-            context.user_data.update({"tmp": path, "st": "name"})
+            context.user_data.update({
+    "tmp_path": path,
+    "state": "WAIT_NAME"
+})
+
             
             # Використовуємо потрійні лапки для максимальної безпеки синтаксису
             response_text = f"""✅ Фото завантажено. 
@@ -425,13 +429,24 @@ AI бачить: {ai_vision_text}.
             await update.message.reply_text(response_text)
 
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if context.user_data.get("state") == "wait_name":
+        if context.user_data.get("state") == "WAIT_NAME":
             name = update.message.text
             t = await OmniDB.load(STORAGE.TARGETS)
-            t.append({"name": name, "path": context.user_data["tmp_p"], "id": secrets.token_hex(4)})
+            t.append({
+    "id": secrets.token_hex(6),
+    "name": name,
+    "path": context.user_data["tmp_path"],
+    "tags": [],
+    "priority": 1,
+    "created": time.time()
+})
+        
             await OmniDB.save(STORAGE.TARGETS, t)
             context.user_data.clear()
             await update.message.reply_text(f"🎯 Ціль '{name}' додана до бази!")
+
+vision = OmniVision()
+
 
 # =============================================================================
 # [6] WEB ADMIN DASHBOARD (AIOHTTP Server)
@@ -488,25 +503,3 @@ def main():
 
     print("🚀 OMNI-AI v25.0 INITIALIZED AND ONLINE")
     omni_bot.application.run_polling(drop_pending_updates=True)
-
-if __name__ == "__main__":
-    try:
-        print("🚀 Ініціалізація систем OmniAI...")
-        
-        # Створюємо екземпляр вашого класу бота
-        bot_system = OmniBot()
-        
-        # Отримуємо доступ до application всередині екземпляра
-        application = bot_system.application
-        
-        # Ініціалізуємо Vision (якщо вона не була створена глобально)
-        # У вашому коді vision = OmniVision() має бути вище
-        if 'vision' not in globals():
-            vision = OmniVision()
-
-        print("🚀 Бот запускається через Polling...")
-        application.run_polling(drop_pending_updates=True)
-        
-    except Exception as e:
-        print(f"💥 КРИТИЧНА ПОМИЛКА ЗАПУСКУ: {e}")
-        traceback.print_exc()
