@@ -187,47 +187,37 @@ class OmniVision:
             return torch.zeros((1, 1000)).to(self.device)
 
     def analyze_deep_match(self, ref_path: str, ad_path: str) -> Dict[str, float]:
-        """Точне порівняння уваги до деталей."""
         try:
             img_ref = cv2.imread(ref_path)
             img_ad = cv2.imread(ad_path)
             if img_ref is None or img_ad is None: return {"score": 0.0}
 
-            # 1. Structural Similarity (Геометрія)
+            # Приводимо до одного розміру для порівняння
             gray_ref = cv2.cvtColor(img_ref, cv2.COLOR_BGR2GRAY)
             gray_ad = cv2.resize(cv2.cvtColor(img_ad, cv2.COLOR_BGR2GRAY), (gray_ref.shape[1], gray_ref.shape[0]))
+            
+            # SSIM (Геометрія)
             score_ssim, _ = ssim(gray_ref, gray_ad, full=True)
 
-            # 2. SIFT Feature Matching (Дрібні деталі)
+            # SIFT (Деталі)
             kp1, des1 = self.sift.detectAndCompute(gray_ref, None)
             kp2, des2 = self.sift.detectAndCompute(gray_ad, None)
             score_sift = 0.0
             if des1 is not None and des2 is not None:
                 matches = self.bf.match(des1, des2)
                 score_sift = len(matches) / max(len(kp1), len(kp2), 1)
-                score_sift = min(1.0, score_sift * 10) # Підсилення для унікальних деталей
+                score_sift = min(1.0, score_sift * 10)
 
-            # 3. Semantic Cosine Similarity (Контекст)
+            # Semantic (ResNet)
             emb1 = self.get_embedding(ref_path)
             emb2 = self.get_embedding(ad_path)
             score_cosine = F.cosine_similarity(emb1, emb2).item()
 
-            # Фінальний зважений результат
-            final = (score_ssim * AI_PARAMS["ssim_weight"]) + \
-                    (score_sift * AI_PARAMS["sift_weight"]) + \
-                    (score_cosine * AI_PARAMS["semantic_weight"])
-            
-            return {
-                "score": float(final),
-                "details": score_sift,
-                "struct": score_ssim,
-                "semantic": score_cosine
-            }
+            final = (score_ssim * 0.3) + (score_sift * 0.4) + (score_cosine * 0.3)
+            return {"score": float(final), "details": score_sift, "struct": score_ssim, "semantic": score_cosine}
         except Exception as e:
-            logger.error(f"Neural matching error: {e}")
+            logger.error(f"AI Analysis Error: {e}")
             return {"score": 0.0}
-
-vision = OmniVision()
 
 # =============================================================================
 # [4] СКАНЕР ТА МЕРЕЖЕВИЙ АНАЛІЗ (Multi-Source Agent)
