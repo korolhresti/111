@@ -502,7 +502,7 @@ def main():
     omni_bot.application.run_polling(drop_pending_updates=True)
 
 
-        if __name__ == "__main__":
+if __name__ == "__main__":
     # Параметр drop_pending_updates видаляє всі старі повідомлення, 
     # які прийшли, поки бот був офлайн або конфліктував
     application.run_polling(drop_pending_updates=True)
