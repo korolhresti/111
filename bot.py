@@ -492,11 +492,13 @@ def main():
 
 if __name__ == "__main__":
     try:
-        # ПЕРЕВІРТЕ: чи збігається назва 'application' з тією, 
-        # яку ви вказали вище при створенні Application.builder()
         print("🚀 Бот запускається...")
-        application.run_polling(drop_pending_updates=True)
-    except NameError as e:
-        print(f"❌ Помилка назви: {e}. Перевірте, як названо об'єкт Application!")
+        # Спробуємо 'app', оскільки 'application' не знайдено
+        if 'app' in globals():
+            app.run_polling(drop_pending_updates=True)
+        elif 'application' in globals():
+            application.run_polling(drop_pending_updates=True)
+        else:
+            print("❌ Помилка: Не знайдено змінну бота (app або application)!")
     except Exception as e:
         print(f"💥 Критична помилка: {e}")
