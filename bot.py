@@ -489,16 +489,24 @@ def main():
     print("🚀 OMNI-AI v25.0 INITIALIZED AND ONLINE")
     omni_bot.application.run_polling(drop_pending_updates=True)
 
-
 if __name__ == "__main__":
     try:
-        print("🚀 Бот запускається...")
-        # Спробуємо 'app', оскільки 'application' не знайдено
-        if 'app' in globals():
-            app.run_polling(drop_pending_updates=True)
-        elif 'application' in globals():
-            application.run_polling(drop_pending_updates=True)
-        else:
-            print("❌ Помилка: Не знайдено змінну бота (app або application)!")
+        print("🚀 Ініціалізація систем OmniAI...")
+        
+        # Створюємо екземпляр вашого класу бота
+        bot_system = OmniBot()
+        
+        # Отримуємо доступ до application всередині екземпляра
+        application = bot_system.application
+        
+        # Ініціалізуємо Vision (якщо вона не була створена глобально)
+        # У вашому коді vision = OmniVision() має бути вище
+        if 'vision' not in globals():
+            vision = OmniVision()
+
+        print("🚀 Бот запускається через Polling...")
+        application.run_polling(drop_pending_updates=True)
+        
     except Exception as e:
-        print(f"💥 Критична помилка: {e}")
+        print(f"💥 КРИТИЧНА ПОМИЛКА ЗАПУСКУ: {e}")
+        traceback.print_exc()
