@@ -1,14 +1,3 @@
-як# -*- coding: utf-8 -*-
-"""
-💎 COLLECTOR BOT OMNI-AI v25.0 - ULTIMATE ENTERPRISE EDITION
-------------------------------------------------------------
-[ENGINE]    Neural-Driven Multi-Agent Global Hunter
-[VISION]    YOLOv8 + SIFT + SSIM + PyTorch Vector Embeddings
-[SOURCES]   Dynamic Plugin System with Proxy-Rotation Logic
-[ANALYTICS] Global Market Arbitrage & IQR Outlier Detection
-[WEB]       Integrated AIOHTTP Admin Dashboard & WebApp
-------------------------------------------------------------
-"""
 
 import os
 import cv2
