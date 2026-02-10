@@ -104,6 +104,12 @@ AI_PARAMS = {
     "user_agent_rotation": True
 }
 
+EMPRESS_BASE = "https://empress.cc"
+EMPRESS_COLLECTION = "https://empress.cc/collections/all"
+EMPRESS_PAGE_PARAM = "?page={}"
+
+
+
 # =============================================================================
 # [2] РОЗШИРЕНА БАЗА ДАНИХ (Async JSON Engine)
 # =============================================================================
@@ -217,6 +223,83 @@ class MarketAgent:
         self.ua = UserAgent()
         self.session = None
         self.history = deque(maxlen=5000)
+
+    async def empress_fetch(session, url):
+    headers = {
+        "User-Agent": ua.random,
+        "Accept-Language": "en-US,en;q=0.9"
+    }
+    async with session.get(url, headers=headers, timeout=30) as r:
+        return await r.text()
+        
+def parse_empress_product(card):
+    title = card.select_one("a.product-item__title")
+    price = card.select_one(".price")
+    img = card.select_one("img")
+
+    if not title or not img:
+        return None
+
+    img_url = img.get("src")
+    if img_url.startswith("//"):
+        img_url = "https:" + img_url
+
+    return {
+        "title": title.text.strip(),
+        "price": int("".join(c for c in price.text if c.isdigit())) if price else None,
+        "image": img_url,
+        "url": EMPRESS_BASE + title.get("href"),
+        "created": time.time()
+    }
+
+
+    async def scan_empress_all():
+    page = 1
+    added = 0
+    targets = load_targets()
+
+    existing_urls = {t.get("sourceurl") for t in targets}
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            url = EMPRESS_COLLECTION + EMPRESS_PAGE_PARAM.format(page)
+            html = await empress_fetch(session, url)
+            soup = BeautifulSoup(html, "lxml")
+
+            cards = soup.select("div.product-item")
+            if not cards:
+                break
+
+            for card in cards:
+                data = parse_empress_product(card)
+                if not data or data["url"] in existing_urls:
+                    continue
+
+                img_bytes = await fetch_image(session, data["image"])
+                img_path = save_image_bytes(img_bytes)
+
+                targets.append({
+                    "id": secrets.token_hex(6),
+                    "name": data["title"],
+                    "path": img_path,
+                    "price": data["price"],
+                    "source": "empress",
+                    "sourceurl": data["url"],
+                    "created": data["created"],
+                    "tags": ["empress"],
+                    "priority": 2
+                })
+
+                added += 1
+
+            page += 1
+            await asyncio.sleep(1.5)
+
+    save_targets(targets)
+    return added
+
+
+    
 
     async def get_session(self):
         if self.session is None or self.session.closed:
@@ -349,7 +432,7 @@ class OmniBot:
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = [
-            [InlineKeyboardButton("➕ Додати ціль (AI)", callback_data="ui_new")],
+            [ InlineKeyboardButton("🌐 Sync Empress", callback_data="sync_empress")],
             [InlineKeyboardButton("📦 Список еталонів", callback_data="ui_list"),
              InlineKeyboardButton("🔌 Джерела", callback_data="ui_src")],
             [InlineKeyboardButton("▶️ СТАРТ AI", callback_data="sys_on"),
@@ -393,6 +476,12 @@ class OmniBot:
             agent.is_running = False
             await q.edit_message_text("🛑 **AI МОНІТОРИНГ ЗУПИНЕНО.**")
 
+
+        elif data == "sync_empress":
+    await query.edit_message_text("⏳ Scanning empress.cc …")
+    added = await scan_empress_all()
+    await query.edit_message_text(f"✅ Empress sync done\nAdded: {added}")
+    
         elif q.data == "ui_list":
             t = await OmniDB.load(STORAGE.TARGETS)
             res = "\n".join([f"• {x['name']}" for x in t]) if t else "Список порожній."
