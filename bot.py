@@ -104,12 +104,6 @@ AI_PARAMS = {
     "user_agent_rotation": True
 }
 
-EMPRESS_BASE = "https://empress.cc"
-EMPRESS_COLLECTION = "https://empress.cc/collections/all"
-EMPRESS_PAGE_PARAM = "?page={}"
-
-
-
 # =============================================================================
 # [2] РОЗШИРЕНА БАЗА ДАНИХ (Async JSON Engine)
 # =============================================================================
@@ -223,83 +217,6 @@ class MarketAgent:
         self.ua = UserAgent()
         self.session = None
         self.history = deque(maxlen=5000)
-
-    async def empress_fetch(session, url):
-    headers = {
-        "User-Agent": ua.random,
-        "Accept-Language": "en-US,en;q=0.9"
-    }
-    async with session.get(url, headers=headers, timeout=30) as r:
-        return await r.text()
-        
-def parse_empress_product(card):
-    title = card.select_one("a.product-item__title")
-    price = card.select_one(".price")
-    img = card.select_one("img")
-
-    if not title or not img:
-        return None
-
-    img_url = img.get("src")
-    if img_url.startswith("//"):
-        img_url = "https:" + img_url
-
-    return {
-        "title": title.text.strip(),
-        "price": int("".join(c for c in price.text if c.isdigit())) if price else None,
-        "image": img_url,
-        "url": EMPRESS_BASE + title.get("href"),
-        "created": time.time()
-    }
-
-
-    async def scan_empress_all():
-    page = 1
-    added = 0
-    targets = load_targets()
-
-    existing_urls = {t.get("sourceurl") for t in targets}
-
-    async with aiohttp.ClientSession() as session:
-        while True:
-            url = EMPRESS_COLLECTION + EMPRESS_PAGE_PARAM.format(page)
-            html = await empress_fetch(session, url)
-            soup = BeautifulSoup(html, "lxml")
-
-            cards = soup.select("div.product-item")
-            if not cards:
-                break
-
-            for card in cards:
-                data = parse_empress_product(card)
-                if not data or data["url"] in existing_urls:
-                    continue
-
-                img_bytes = await fetch_image(session, data["image"])
-                img_path = save_image_bytes(img_bytes)
-
-                targets.append({
-                    "id": secrets.token_hex(6),
-                    "name": data["title"],
-                    "path": img_path,
-                    "price": data["price"],
-                    "source": "empress",
-                    "sourceurl": data["url"],
-                    "created": data["created"],
-                    "tags": ["empress"],
-                    "priority": 2
-                })
-
-                added += 1
-
-            page += 1
-            await asyncio.sleep(1.5)
-
-    save_targets(targets)
-    return added
-
-
-    
 
     async def get_session(self):
         if self.session is None or self.session.closed:
@@ -432,7 +349,7 @@ class OmniBot:
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = [
-            [ InlineKeyboardButton("🌐 Sync Empress", callback_data="sync_empress")],
+            [InlineKeyboardButton("➕ Додати ціль (AI)", callback_data="ui_new")],
             [InlineKeyboardButton("📦 Список еталонів", callback_data="ui_list"),
              InlineKeyboardButton("🔌 Джерела", callback_data="ui_src")],
             [InlineKeyboardButton("▶️ СТАРТ AI", callback_data="sys_on"),
@@ -462,7 +379,7 @@ class OmniBot:
         await q.answer()
 
         if q.data == "ui_new":
-            context.user_data["state"] = "WAIT_IMG"
+            context.user_data["state"] = "wait_img"
             await q.edit_message_text("📸 Надішліть **ФОТО ЕТАЛОНА** (AI проаналізує деталі):")
         
         elif q.data == "sys_on":
@@ -476,19 +393,13 @@ class OmniBot:
             agent.is_running = False
             await q.edit_message_text("🛑 **AI МОНІТОРИНГ ЗУПИНЕНО.**")
 
-
-        elif data == "sync_empress":
-    await query.edit_message_text("⏳ Scanning empress.cc …")
-    added = await scan_empress_all()
-    await query.edit_message_text(f"✅ Empress sync done\nAdded: {added}")
-    
         elif q.data == "ui_list":
             t = await OmniDB.load(STORAGE.TARGETS)
             res = "\n".join([f"• {x['name']}" for x in t]) if t else "Список порожній."
             await q.edit_message_text(f"📦 **Ваші цілі:**\n{res}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="back")]]))
 
     async def handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if context.user_data.get("state") == "WAIT_IMG":
+        if context.user_data.get("st") == "wait_img":
             file = await update.message.photo[-1].get_file()
             path = str(MEDIA_DIR / "targets" / f"ref_{secrets.token_hex(4)}.jpg")
             await file.download_to_drive(path)
@@ -504,11 +415,7 @@ class OmniBot:
             else:
                 ai_vision_text = "Обʼєкт"  # Використовуємо модифікований апостроф (U+02BC) або просто текст
             
-            context.user_data.update({
-    "tmp_path": path,
-    "state": "WAIT_NAME"
-})
-
+            context.user_data.update({"tmp": path, "st": "name"})
             
             # Використовуємо потрійні лапки для максимальної безпеки синтаксису
             response_text = f"""✅ Фото завантажено. 
@@ -518,24 +425,13 @@ AI бачить: {ai_vision_text}.
             await update.message.reply_text(response_text)
 
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if context.user_data.get("state") == "WAIT_NAME":
+        if context.user_data.get("state") == "wait_name":
             name = update.message.text
             t = await OmniDB.load(STORAGE.TARGETS)
-            t.append({
-    "id": secrets.token_hex(6),
-    "name": name,
-    "path": context.user_data["tmp_path"],
-    "tags": [],
-    "priority": 1,
-    "created": time.time()
-})
-        
+            t.append({"name": name, "path": context.user_data["tmp_p"], "id": secrets.token_hex(4)})
             await OmniDB.save(STORAGE.TARGETS, t)
             context.user_data.clear()
             await update.message.reply_text(f"🎯 Ціль '{name}' додана до бази!")
-
-vision = OmniVision()
-
 
 # =============================================================================
 # [6] WEB ADMIN DASHBOARD (AIOHTTP Server)
@@ -592,3 +488,25 @@ def main():
 
     print("🚀 OMNI-AI v25.0 INITIALIZED AND ONLINE")
     omni_bot.application.run_polling(drop_pending_updates=True)
+    
+if __name__ == "__main__":
+    try:
+        print("🚀 Ініціалізація систем OmniAI...")
+        
+        # Створюємо екземпляр вашого класу бота
+        bot_system = OmniBot()
+        
+        # Отримуємо доступ до application всередині екземпляра
+        application = bot_system.application
+        
+        # Ініціалізуємо Vision (якщо вона не була створена глобально)
+        # У вашому коді vision = OmniVision() має бути вище
+        if 'vision' not in globals():
+            vision = OmniVision()
+
+        print("🚀 Бот запускається через Polling...")
+        application.run_polling(drop_pending_updates=True)
+        
+    except Exception as e:
+        print(f"💥 КРИТИЧНА ПОМИЛКА ЗАПУСКУ: {e}")
+        traceback.print_exc()
