@@ -1,9 +1,4 @@
 
-# ============================================================================
-# CollectorBot Industrial v30.0
-# Python 3.13 | Production-Grade AI Monitoring System
-# AutoML · Distributed Processing · Predictive Intelligence · Enterprise Scale
-# ============================================================================
 
 import os
 import json
@@ -66,6 +61,12 @@ from telegram.constants import ParseMode
 # [1] ПРОМИСЛОВА КОНФІГУРАЦІЯ З AUTO-TUNING
 # ============================================================================
 
+REPLICA_KEYWORDS = [
+    "репліка", "копія", "copy", "aaa", "aa+", 
+    "1:1", "replica", "clone", "реп", "дублікат",
+    "підробка", "fake", "unoriginal"
+]
+
 class AutoConfig:
     """Самоналагоджувальна конфігурація"""
     
@@ -86,24 +87,17 @@ class AutoConfig:
         self.IS_RENDER = os.getenv("RENDER", "false").lower() == "true"
         
         # ML-параметри, що самоналаштовуються
-        self.SIMILARITY_THRESHOLD = 0.75  # Початкове значення, буде оптимізовано
+        self.SIMILARITY_THRESHOLD = 0.75
         self.BATCH_SIZE = self._auto_batch_size()
         self.SCRAPE_INTERVAL = self._auto_interval()
         self.MAX_WORKERS = max(1, self.CPU_COUNT - 1)
         
         # Параметри AI
-
-        # Визначаємо потужність системи (Render Free = 0.5GB RAM)
-        # Якщо RAM_GB не визначився правильно, краще занизити можливості, ніж отримати Crash
         is_low_mem = self.RAM_GB < 1.0 
-
-        self.USE_TORCH = torch.cuda.is_available() # На Render CPU зазвичай False
-        
-        # Вибираємо найменші моделі для Render
-        self.YOLO_MODEL = "yolov8n.pt" # Force Nano version for Render stability
+        self.USE_TORCH = torch.cuda.is_available()
+        self.YOLO_MODEL = "yolov8n.pt"
         self.EMBEDDING_MODEL = "resnet18" if is_low_mem else ("resnet50" if self.RAM_GB > 6 else "resnet18")
         
-        # Обмежуємо кількість потоків Torch, щоб не роздувати RAM
         if is_low_mem:
             torch.set_num_threads(1)
             
@@ -116,10 +110,9 @@ class AutoConfig:
             import psutil
             return psutil.virtual_memory().total / (1024**3)
         except:
-            return 2.0  # fallback
+            return 2.0
     
     def _auto_batch_size(self):
-        """Автоматичний вибір batch size на основі RAM"""
         ram = self._get_ram_gb()
         if ram > 8: return 15
         if ram > 4: return 10
@@ -127,13 +120,11 @@ class AutoConfig:
         return 3
     
     def _auto_interval(self):
-        """Автоматичний інтервал сканування"""
         if self.IS_RENDER:
-            return 600  # 10 хвилин для Render
-        return 300  # 5 хвилин для потужних машин
+            return 600
+        return 300
     
     def _init_paths(self):
-        """Ініціалізація шляхів"""
         self.BASE_DIR = Path(__file__).parent.resolve()
         self.DATA_DIR = self.BASE_DIR / "industrial_data"
         self.MODELS_DIR = self.DATA_DIR / "models"
@@ -141,8 +132,6 @@ class AutoConfig:
         self.LOGS_DIR = self.DATA_DIR / "logs"
         self.TARGETS_DIR = self.DATA_DIR / "targets"
         self.DATASET_DIR = self.DATA_DIR / "dataset"
-        # Додайте це всередину класу Config
-        self.EMPRESS_COLLECTION = "https://empress.com/collection" # Або ваше посилання
         
         for d in [self.DATA_DIR, self.MODELS_DIR, self.CACHE_DIR, 
                   self.LOGS_DIR, self.TARGETS_DIR, self.DATASET_DIR]:
@@ -155,7 +144,6 @@ class AutoConfig:
             raise RuntimeError("❌ ADMIN_CHAT_ID missing")
     
     def update_threshold(self, success_rate: float):
-        """Адаптивне налаштування порогу"""
         self.performance_metrics.append(success_rate)
         if len(self.performance_metrics) > 50:
             avg_success = np.mean(self.performance_metrics)
@@ -177,27 +165,23 @@ class IndustrialLogger:
         self.logger = logging.getLogger("IndustrialCollector")
         self.logger.setLevel(logging.INFO)
         
-        # Форматування
         formatter = logging.Formatter(
             '%(asctime)s.%(msecs)03d | %(levelname)8s | %(name)s | %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
         
-        # Файловий handler з ротацією
         log_file = CONFIG.LOGS_DIR / "industrial.log"
         file_handler = logging.handlers.RotatingFileHandler(
             log_file, maxBytes=50*1024*1024, backupCount=10
         )
         file_handler.setFormatter(formatter)
         
-        # Консольний handler
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(formatter)
         
         self.logger.addHandler(file_handler)
         self.logger.addHandler(console_handler)
         
-        # Метрики
         self.metrics = defaultdict(list)
         self.start_time = time.time()
     
@@ -232,11 +216,11 @@ class IndustrialLogger:
 log = IndustrialLogger()
 
 # ============================================================================
-# [3] ВИСОКОПРОДУКТИВНА БАЗА ДАНИХ (SQLite + JSON Hybrid)
+# [3] ВИСОКОПРОДУКТИВНА БАЗА ДАНИХ
 # ============================================================================
 
 class IndustrialDatabase:
-    """Гібридна БД: SQLite для структурованих даних + JSON для гнучкості"""
+    """Гібридна БД: SQLite для структурованих даних"""
     
     def __init__(self):
         self.db_path = CONFIG.DATA_DIR / "collector.db"
@@ -244,13 +228,11 @@ class IndustrialDatabase:
         self._init_db()
     
     def _init_db(self):
-        """Ініціалізація схеми БД"""
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         
         cursor = self.conn.cursor()
         
-        # Таблиця цілей
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS targets (
                 id TEXT PRIMARY KEY,
@@ -269,7 +251,6 @@ class IndustrialDatabase:
             )
         ''')
         
-        # Таблиця історії пошуку
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS search_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -284,7 +265,6 @@ class IndustrialDatabase:
             )
         ''')
         
-        # Таблиця ринкових даних
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS market_intel (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -295,7 +275,6 @@ class IndustrialDatabase:
             )
         ''')
         
-        # Таблиця продуктивності
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS performance (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -307,7 +286,6 @@ class IndustrialDatabase:
             )
         ''')
         
-        # Індекси
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_targets_name ON targets(name)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_history_url ON search_history(ad_url)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_market_name ON market_intel(target_name)')
@@ -315,7 +293,6 @@ class IndustrialDatabase:
         self.conn.commit()
     
     async def execute(self, query: str, params: tuple = ()):
-        """Асинхронне виконання запиту"""
         return await asyncio.get_event_loop().run_in_executor(
             None, self._sync_execute, query, params
         )
@@ -341,7 +318,6 @@ class IndustrialDatabase:
         return rows[0] if rows else None
     
     async def add_target(self, target: Dict):
-        """Додавання цілі"""
         query = '''
             INSERT OR REPLACE INTO targets 
             (id, name, path, source, source_url, price, created, priority, tags, metadata)
@@ -353,22 +329,21 @@ class IndustrialDatabase:
             target.get('path'),
             target.get('source'),
             target.get('source_url'),
-            target.get('price'),
+            target.get('price', 0),
             target.get('created', time.time()),
             target.get('priority', 1),
             json.dumps(target.get('tags', [])),
             json.dumps(target.get('metadata', {}))
         ))
+        return True
     
     async def get_targets(self, active_only=True):
-        """Отримання цілей з пріоритетами"""
         query = 'SELECT * FROM targets'
         if active_only:
             query += ' ORDER BY priority DESC, created DESC'
         return await self.fetch_all(query)
     
     async def add_match(self, target_id: str, ad: Dict, similarity: float):
-        """Додавання знайденого збігу"""
         query = '''
             INSERT OR IGNORE INTO search_history 
             (target_id, ad_url, ad_title, ad_price, similarity, timestamp, source)
@@ -384,7 +359,6 @@ class IndustrialDatabase:
             ad.get('source', 'olx')
         ))
         
-        # Оновлюємо статистику цілі
         await self.execute('''
             UPDATE targets 
             SET match_count = match_count + 1 
@@ -392,7 +366,6 @@ class IndustrialDatabase:
         ''', (target_id,))
     
     async def log_performance(self, operation: str, duration: float, success: bool, metadata: Dict = None):
-        """Логування продуктивності"""
         await self.execute('''
             INSERT INTO performance (operation, duration, success, timestamp, metadata)
             VALUES (?, ?, ?, ?, ?)
@@ -401,11 +374,11 @@ class IndustrialDatabase:
 DB = IndustrialDatabase()
 
 # ============================================================================
-# [4] РОЗПОДІЛЕНИЙ ML-ENGINE З АВТОНОМНИМ НАВЧАННЯМ
+# [4] РОЗПОДІЛЕНИЙ ML-ENGINE
 # ============================================================================
 
 class AutonomousMLEngine:
-    """Автономний ML-двигун з самонавчанням та оптимізацією"""
+    """Автономний ML-двигун з самонавчанням"""
     
     def __init__(self):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -414,63 +387,50 @@ class AutonomousMLEngine:
         self.scaler = StandardScaler()
         self.is_trained = False
         
-        # Ініціалізація моделей
         self._init_models()
+        self._load_or_train()
     
     def _init_models(self):
-        """Оптимізована ініціалізація ML-моделей для Render"""
-        # Визначаємо, чи ми в умовах обмеженої пам'яті
         is_low_mem = CONFIG.RAM_GB < 2.0
-
-        # 1. Семантичний енкодер (Оптимізовано для Render)
+        
         if CONFIG.USE_TORCH:
-            from torchvision.models import ResNet18_Weights, ResNet50_Weights
-            
-            # Примусово використовуємо ResNet18, якщо RAM менше 2ГБ
-            is_low_mem = CONFIG.RAM_GB < 2.0
-            
-            if is_low_mem:
-                log.info("📉 Low RAM detected: Using ResNet18 instead of ResNet50")
-                base_model = models.resnet18(weights=ResNet18_Weights.DEFAULT)
-            else:
-                base_model = models.resnet50(weights=ResNet50_Weights.DEFAULT)
-            
-            base_model.to(self.device).eval()
-            self.models['encoder'] = torch.nn.Sequential(*list(base_model.children())[:-1])
-            
-            # Очищення пам'яті після створення
-            del base_model
-            gc.collect()
-
-        # 2. Класифікатор якості
+            try:
+                if is_low_mem:
+                    log.info("📉 Low RAM detected: Using ResNet18")
+                    base_model = models.resnet18(pretrained=True)
+                else:
+                    base_model = models.resnet50(pretrained=True)
+                
+                base_model.to(self.device).eval()
+                self.models['encoder'] = torch.nn.Sequential(*list(base_model.children())[:-1])
+                del base_model
+                gc.collect()
+            except Exception as e:
+                log.error(f"Failed to load ResNet: {e}")
+                CONFIG.USE_TORCH = False
+        
         self.models['quality'] = RandomForestRegressor(
             n_estimators=50,
             max_depth=7,
             random_state=42,
-            n_jobs=1  # Було CONFIG.CPU_COUNT
+            n_jobs=1
         )
         
-        # 3. Детектор аномалій
         self.models['anomaly'] = IsolationForest(
             n_estimators=50,
             contamination=0.1,
             random_state=42,
-            n_jobs=1  # Було CONFIG.CPU_COUNT
+            n_jobs=1
         )
         
-        # 4. Кластеризатор
         self.models['cluster'] = DBSCAN(eps=0.3, min_samples=3, n_jobs=1)
-        
-        # 5. YOLO детектор (Використовуємо ТІЛЬКИ Nano версію)
-        # CONFIG.YOLO_MODEL має бути "yolov8n.pt"
         self.models['yolo'] = YOLO(CONFIG.YOLO_MODEL)
         
-        # 6. ОЧИЩЕННЯ ПАМ'ЯТІ (Критично важливо!)
-        import gc
         gc.collect()
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
-        """Завантаження або тренування моделей"""
+    
+    def _load_or_train(self):
         model_path = CONFIG.MODELS_DIR / 'quality_model.pkl'
         if model_path.exists():
             try:
@@ -481,16 +441,13 @@ class AutonomousMLEngine:
                 pass
     
     async def extract_features(self, image_path: str) -> np.ndarray:
-        """Екстракція глибоких ознак"""
-        if not CONFIG.USE_TORCH:
+        if not CONFIG.USE_TORCH or 'encoder' not in self.models:
             return await self._extract_cv_features(image_path)
         
         try:
-            # Завантаження з кешу
             if image_path in self.embeddings_cache:
                 return self.embeddings_cache[image_path]
             
-            # Завантаження та підготовка зображення
             img = Image.open(image_path).convert('RGB')
             preprocess = transforms.Compose([
                 transforms.Resize(256),
@@ -502,14 +459,11 @@ class AutonomousMLEngine:
             
             input_tensor = preprocess(img).unsqueeze(0).to(self.device)
             
-            # Екстракція ознак
             with torch.no_grad():
                 features = self.models['encoder'](input_tensor)
                 features = features.cpu().numpy().flatten()
             
-            # Кешування
             self.embeddings_cache[image_path] = features
-            
             return features
             
         except Exception as e:
@@ -517,22 +471,18 @@ class AutonomousMLEngine:
             return await self._extract_cv_features(image_path)
     
     async def _extract_cv_features(self, image_path: str) -> np.ndarray:
-        """CV-based feature extraction (fallback)"""
         img = cv2.imread(image_path)
         if img is None:
             return np.zeros(128)
         
-        # ORB features
         orb = cv2.ORB_create(200)
         kp, des = orb.detectAndCompute(img, None)
         
         if des is None:
             return np.zeros(128)
         
-        # Усереднення дескрипторів
         features = des.mean(axis=0)
         
-        # Padding/truncation to 128
         if len(features) < 128:
             features = np.pad(features, (0, 128 - len(features)))
         else:
@@ -541,16 +491,12 @@ class AutonomousMLEngine:
         return features
     
     async def predict_quality(self, target_path: str, candidate_path: str) -> Dict:
-        """Предиктивна оцінка якості збігу"""
-        # Екстракція ознак
         feat1 = await self.extract_features(target_path)
         feat2 = await self.extract_features(candidate_path)
         
-        # Обчислення метрик
         cosine_sim = 1 - cosine(feat1, feat2)
         euclidean_dist = euclidean(feat1, feat2)
         
-        # CV метрики
         img1 = cv2.imread(target_path)
         img2 = cv2.imread(candidate_path)
         
@@ -561,7 +507,6 @@ class AutonomousMLEngine:
         else:
             ssim_score = 0
         
-        # Предикція якості
         features = np.array([[
             cosine_sim,
             euclidean_dist,
@@ -573,7 +518,6 @@ class AutonomousMLEngine:
         if self.is_trained:
             quality_score = self.models['quality'].predict(features)[0]
         else:
-            # Зважена оцінка
             quality_score = (cosine_sim * 0.4 + ssim_score * 0.4 + 
                            (1 - euclidean_dist/10) * 0.2)
         
@@ -586,17 +530,14 @@ class AutonomousMLEngine:
         }
     
     def detect_anomaly(self, features: np.ndarray) -> bool:
-        """Виявлення аномалій"""
         if not self.is_trained:
             return False
         prediction = self.models['anomaly'].predict(features)
         return prediction[0] == -1
     
     async def train_quality_model(self):
-        """Тренування моделі якості на історичних даних"""
         log.info("🧠 Starting quality model training...")
         
-        # Збір даних з історії
         history = await DB.fetch_all('''
             SELECT h.*, t.path as target_path 
             FROM search_history h
@@ -616,14 +557,12 @@ class AutonomousMLEngine:
             if not os.path.exists(item['target_path']):
                 continue
             
-            # Екстракція ознак (спрощено для тренування)
             feat1 = await self.extract_features(item['target_path'])
             
-            # Використовуємо similarity як цільову змінну
             X.append([
-                0.7,  # placeholder
-                0.5,  # placeholder
-                0.8,  # placeholder
+                0.7,
+                0.5,
+                0.8,
                 len(feat1) / 1000,
                 item['ad_price'] / 10000 if item['ad_price'] else 0.5
             ])
@@ -632,11 +571,9 @@ class AutonomousMLEngine:
         X = np.array(X)
         y = np.array(y)
         
-        # Тренування
         self.models['quality'].fit(X, y)
         self.is_trained = True
         
-        # Збереження моделі
         joblib.dump(self.models['quality'], 
                    CONFIG.MODELS_DIR / 'quality_model.pkl')
         
@@ -644,7 +581,6 @@ class AutonomousMLEngine:
         return True
     
     def detect_objects_yolo(self, image_path: str) -> List[Dict]:
-        """YOLO детекція об'єктів"""
         try:
             results = self.models['yolo'](image_path, conf=0.4, verbose=False)
             detections = []
@@ -671,11 +607,11 @@ class AutonomousMLEngine:
 ML_ENGINE = AutonomousMLEngine()
 
 # ============================================================================
-# [5] РОЗПОДІЛЕНИЙ ПАРСИНГ З АВТОМАТИЧНИМ РОЗШИРЕННЯМ
+# [5] РОЗПОДІЛЕНИЙ ПАРСИНГ
 # ============================================================================
 
 class DistributedParser:
-    """Розподілений парсер з автоматичним додаванням джерел"""
+    """Розподілений парсер з автоматичним розширенням"""
     
     def __init__(self):
         self.sources = self._load_sources()
@@ -684,9 +620,7 @@ class DistributedParser:
         self.rate_limiter = defaultdict(lambda: deque(maxlen=60))
     
     def _load_sources(self) -> List[Dict]:
-        """Завантаження та авто-розширення джерел"""
         sources = [
-            # OLX Україна
             {
                 'name': 'olx_ua',
                 'base_url': 'https://www.olx.ua',
@@ -700,7 +634,6 @@ class DistributedParser:
                 'pagination': '?page={page}',
                 'weight': 1.0
             },
-            # Prom.ua
             {
                 'name': 'prom_ua',
                 'base_url': 'https://prom.ua',
@@ -712,7 +645,6 @@ class DistributedParser:
                 'link_selector': 'a[data-qaid="product_link"]',
                 'weight': 0.8
             },
-            # Rozetka
             {
                 'name': 'rozetka',
                 'base_url': 'https://rozetka.com.ua',
@@ -726,7 +658,6 @@ class DistributedParser:
             }
         ]
         
-        # Завантаження кастомних джерел
         custom_sources_file = CONFIG.DATA_DIR / 'custom_sources.json'
         if custom_sources_file.exists():
             try:
@@ -739,7 +670,6 @@ class DistributedParser:
         return sources
     
     async def get_session(self):
-        """Отримання або створення сесії"""
         if self.session_pool:
             session = self.session_pool.popleft()
             if not session.closed:
@@ -767,15 +697,12 @@ class DistributedParser:
         return session
     
     async def release_session(self, session):
-        """Повернення сесії в пул"""
         if not session.closed:
             self.session_pool.append(session)
     
     async def search_source(self, source: Dict, query: str, limit: int = 20) -> List[Dict]:
-        """Пошук по одному джерелу"""
         source_name = source['name']
         
-        # Rate limiting
         now = time.time()
         self.rate_limiter[source_name].append(now)
         
@@ -786,46 +713,38 @@ class DistributedParser:
         
         session = await self.get_session()
         try:
-            # Формування URL
             url = source['search_url'].format(query=query.replace(' ', '+'))
             if 'pagination' in source:
                 url += source['pagination'].format(page=1)
             
-            # Ротація User-Agent
             headers = {'User-Agent': UserAgent().random}
             
             async with session.get(url, headers=headers) as response:
                 if response.status != 200:
-                    log.warning(f"{source_name} returned {response.status}")
                     return []
                 
                 html = await response.text()
             
-            # Парсинг
             soup = BeautifulSoup(html, 'lxml')
             cards = soup.select(source['card_selector'])
             
             results = []
             for card in cards[:limit]:
-                # Перевірка на рекламні/топ оголошення
                 if 'featured_selector' in source:
                     if card.select_one(source['featured_selector']):
                         continue
                 
-                # Заголовок
                 title_elem = card.select_one(source['title_selector'])
                 if not title_elem:
                     continue
                 title = title_elem.text.strip()
                 
-                # Ціна
                 price = "—"
                 if 'price_selector' in source:
                     price_elem = card.select_one(source['price_selector'])
                     if price_elem:
                         price = price_elem.text.strip()
                 
-                # Посилання
                 url = None
                 if 'link_selector' in source:
                     link_elem = card.select_one(source['link_selector'])
@@ -833,7 +752,6 @@ class DistributedParser:
                         href = link_elem['href']
                         url = href if href.startswith('http') else source['base_url'] + href
                 
-                # Зображення
                 images = []
                 if 'image_selector' in source:
                     img_elems = card.select(source['image_selector'])
@@ -862,7 +780,6 @@ class DistributedParser:
             await self.release_session(session)
     
     async def parallel_search(self, query: str) -> List[Dict]:
-        """Паралельний пошук по всіх джерелах"""
         tasks = []
         for source in self.sources:
             task = asyncio.create_task(self.search_source(source, query))
@@ -870,21 +787,19 @@ class DistributedParser:
         
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        # Об'єднання результатів
         all_ads = []
         for res in results:
             if isinstance(res, list):
                 all_ads.extend(res)
         
-        # Сортування за релевантністю (ціна, свіжість)
         all_ads.sort(key=lambda x: len(x.get('images', [])), reverse=True)
         
-        return all_ads[:BATCH_SIZE * 3]
+        return all_ads[:CONFIG.BATCH_SIZE * 3]
 
 PARSER = DistributedParser()
 
 # ============================================================================
-# [6] ПРОМИСЛОВИЙ CV-ENGINE З БАГАТОРІВНЕВИМ АНАЛІЗОМ
+# [6] ПРОМИСЛОВИЙ CV-ENGINE
 # ============================================================================
 
 class IndustrialCVEngine:
@@ -896,7 +811,6 @@ class IndustrialCVEngine:
         self.stats = defaultdict(list)
     
     def _init_methods(self) -> Dict:
-        """Ініціалізація ансамблю методів"""
         return {
             'phash': {'weight': 0.25, 'func': self._phash_similarity},
             'orb': {'weight': 0.20, 'func': self._orb_similarity},
@@ -906,7 +820,6 @@ class IndustrialCVEngine:
         }
     
     def _phash_similarity(self, img1, img2):
-        """Perceptual hash similarity"""
         def phash(img):
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             resized = cv2.resize(gray, (32, 32))
@@ -920,7 +833,6 @@ class IndustrialCVEngine:
         return 1.0 - (np.count_nonzero(h1 != h2) / len(h1))
     
     def _orb_similarity(self, img1, img2):
-        """ORB feature matching"""
         orb = cv2.ORB_create(1000)
         kp1, des1 = orb.detectAndCompute(img1, None)
         kp2, des2 = orb.detectAndCompute(img2, None)
@@ -934,12 +846,10 @@ class IndustrialCVEngine:
         if not matches:
             return 0.0
         
-        # Якість матчів
         good_matches = [m for m in matches if m.distance < 50]
         return len(good_matches) / max(len(kp1), len(kp2), 1)
     
     def _hsv_similarity(self, img1, img2):
-        """HSV color histogram similarity"""
         hsv1 = cv2.cvtColor(img1, cv2.COLOR_BGR2HSV)
         hsv2 = cv2.cvtColor(img2, cv2.COLOR_BGR2HSV)
         
@@ -952,7 +862,6 @@ class IndustrialCVEngine:
         return cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
     
     def _ssim_similarity(self, img1, img2):
-        """Structural similarity"""
         gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
         gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
         
@@ -960,12 +869,10 @@ class IndustrialCVEngine:
         return score
     
     async def _deep_similarity(self, img1, img2):
-        """Deep learning similarity"""
-        if not CONFIG.USE_TORCH:
+        if not CONFIG.USE_TORCH or 'encoder' not in ML_ENGINE.models:
             return self._orb_similarity(img1, img2)
         
         try:
-            # Тимчасові файли
             path1 = CONFIG.CACHE_DIR / f"deep_{secrets.token_hex(4)}_1.jpg"
             path2 = CONFIG.CACHE_DIR / f"deep_{secrets.token_hex(4)}_2.jpg"
             
@@ -975,7 +882,6 @@ class IndustrialCVEngine:
             feat1 = await ML_ENGINE.extract_features(str(path1))
             feat2 = await ML_ENGINE.extract_features(str(path2))
             
-            # Прибирання
             path1.unlink(missing_ok=True)
             path2.unlink(missing_ok=True)
             
@@ -986,7 +892,6 @@ class IndustrialCVEngine:
             return 0.0
     
     async def analyze(self, target_path: str, candidate_path: str, use_cache: bool = True) -> Dict:
-        """Повний аналіз зображень"""
         cache_key = f"{target_path}:{candidate_path}"
         
         if use_cache and cache_key in self.cache:
@@ -994,18 +899,15 @@ class IndustrialCVEngine:
         
         start_time = time.time()
         
-        # Завантаження зображень
         img1 = cv2.imread(target_path)
         img2 = cv2.imread(candidate_path)
         
         if img1 is None or img2 is None:
             return {'score': 0.0, 'method_scores': {}}
         
-        # Ресайз для швидкості
         img1 = cv2.resize(img1, (640, 640))
         img2 = cv2.resize(img2, (640, 640))
         
-        # Обчислення всіх методів
         scores = {}
         for name, method in self.methods.items():
             try:
@@ -1018,7 +920,6 @@ class IndustrialCVEngine:
                 log.error(f"Method {name} error: {e}")
                 scores[name] = 0.0
         
-        # Зважена оцінка
         weighted_score = sum(
             scores[name] * self.methods[name]['weight']
             for name in scores
@@ -1030,7 +931,6 @@ class IndustrialCVEngine:
             'execution_time': time.time() - start_time
         }
         
-        # Кешування
         self.cache[cache_key] = result
         if len(self.cache) > 1000:
             self.cache.clear()
@@ -1038,18 +938,17 @@ class IndustrialCVEngine:
         return result
     
     def clear_cache(self):
-        """Очищення кешу"""
         self.cache.clear()
         log.info("🧹 CV cache cleared")
 
 CV_ENGINE = IndustrialCVEngine()
 
 # ============================================================================
-# [7] ПРОМИСЛОВИЙ МОНІТОРИНГ З ПАКЕТНОЮ ОБРОБКОЮ
+# [7] ПРОМИСЛОВИЙ МОНІТОРИНГ
 # ============================================================================
 
 class IndustrialMonitor:
-    """Промисловий моніторинг з пакетною обробкою та оптимізацією"""
+    """Промисловий моніторинг з пакетною обробкою"""
     
     def __init__(self):
         self.is_running = False
@@ -1062,7 +961,6 @@ class IndustrialMonitor:
         }
     
     async def start(self, context):
-        """Запуск моніторингу"""
         if self.is_running:
             return
         
@@ -1071,7 +969,6 @@ class IndustrialMonitor:
         log.info("🚀 Industrial monitor started")
     
     async def stop(self):
-        """Зупинка моніторингу"""
         self.is_running = False
         if self.task:
             self.task.cancel()
@@ -1083,64 +980,31 @@ class IndustrialMonitor:
         log.info("🛑 Industrial monitor stopped")
     
     async def _monitor_loop(self, context):
-        """Головний цикл моніторингу"""
         while self.is_running:
             batch_start = time.time()
             
             try:
-                # Отримання цілей з пріоритетами
                 targets = await DB.get_targets()
                 
                 if not targets:
                     await asyncio.sleep(30)
                     continue
                 
-                # Пріоритетне сортування
                 targets.sort(key=lambda x: (
                     -x.get('priority', 1),
                     -x.get('match_count', 0),
                     x.get('search_count', 0)
                 ))
                 
-                # Вибірка для поточного батчу
                 batch = targets[:CONFIG.BATCH_SIZE]
                 
-    
-     async def _handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обробка натискань на кнопки"""
-        query = update.callback_query
-        await query.answer()
-        
-        if query.data == "sync":
-            added = await self.sync_empress()
-            await query.message.reply_text(f"✅ Синхронізація завершена! Додано: {added}")
-        
-        elif query.data == "stats":
-            await self.cmd_stats(update, context)
-
-    async def _process_target(self, target, context):
-        """Пакетна обробка цілей нейромережею"""
-        try:
-            images = await self._get_target_images(target)
-            if not images:
-                return
-
-            tasks = []
-            for i in range(0, len(images), CONFIG.BATCH_SIZE):
-                batch = images[i:i + CONFIG.BATCH_SIZE]
-                # Створення завдання для обробки пакету
-                task = self.vision.process_batch(batch, target)
-                tasks.append(task)
-            
-            # Виконання всіх завдань
-            await asyncio.gather(*tasks, return_exceptions=True)
-            
-        except Exception as e:
-            log.error(f"Error processing target {target.get('id')}: {e}")
-            
-        # Запускаємо всі пакети одночасно
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-                # Аналіз результатів
+                tasks = [
+                    self._process_target(target, context)
+                    for target in batch
+                ]
+                
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
                 for target, result in zip(batch, results):
                     if isinstance(result, Exception):
                         log.error(f"Target {target['name']} failed: {result}")
@@ -1148,22 +1012,18 @@ class IndustrialMonitor:
                     else:
                         self.stats['processed'] += 1
                 
-                # Оновлення статистики
                 batch_time = time.time() - batch_start
                 self.stats['avg_time'] = (
                     self.stats['avg_time'] * 0.9 + batch_time * 0.1
                 )
                 
-                # Логування метрик
                 log.metric('batch_size', len(batch))
                 log.metric('batch_time', batch_time)
                 
-                # Адаптивне налаштування
                 if self.stats['processed'] > 100:
                     success_rate = self.stats['matches'] / self.stats['processed']
                     CONFIG.update_threshold(success_rate)
                 
-                # Пауза між батчами
                 await asyncio.sleep(CONFIG.SCRAPE_INTERVAL)
                 
             except asyncio.CancelledError:
@@ -1173,40 +1033,34 @@ class IndustrialMonitor:
                 await asyncio.sleep(60)
     
     async def _process_target(self, target: Dict, context):
-        """Обробка однієї цілі"""
         start_time = time.time()
         
         try:
-            # Оновлення лічильника пошуку
             await DB.execute(
                 'UPDATE targets SET search_count = search_count + 1 WHERE id = ?',
                 (target['id'],)
             )
             
-            # Паралельний пошук по всіх джерелах
             ads = await PARSER.parallel_search(target['name'])
             
             if not ads:
                 return
             
-            # Перевірка на дублікати
             existing = await DB.fetch_all(
                 'SELECT ad_url FROM search_history WHERE target_id = ?',
                 (target['id'],)
             )
             existing_urls = {e['ad_url'] for e in existing}
             
-            # Фільтрація нових оголошень
             new_ads = [ad for ad in ads if ad.get('url') not in existing_urls]
             
             if not new_ads:
                 return
             
-            # Пакетний аналіз зображень
-            for ad in new_ads[:5]:  # Максимум 5 на оголошення
+            for ad in new_ads[:5]:
                 best_score = 0.0
                 
-                for img_url in ad.get('images', [])[:3]:  # Максимум 3 фото
+                for img_url in ad.get('images', [])[:3]:
                     score = await self._analyze_ad_image(target, img_url)
                     best_score = max(best_score, score)
                 
@@ -1214,7 +1068,6 @@ class IndustrialMonitor:
                     await self._process_match(target, ad, best_score, context)
                     self.stats['matches'] += 1
             
-            # Логування продуктивності
             await DB.log_performance(
                 'process_target',
                 time.time() - start_time,
@@ -1232,11 +1085,9 @@ class IndustrialMonitor:
             raise
     
     async def _analyze_ad_image(self, target: Dict, img_url: str) -> float:
-        """Аналіз одного зображення"""
         temp_path = CONFIG.CACHE_DIR / f"ad_{secrets.token_hex(8)}.jpg"
         
         try:
-            # Завантаження зображення
             async with aiohttp.ClientSession() as session:
                 async with session.get(img_url, timeout=15) as response:
                     if response.status != 200:
@@ -1246,15 +1097,13 @@ class IndustrialMonitor:
                     async with aiofiles.open(temp_path, 'wb') as f:
                         await f.write(content)
             
-            # YOLO детекція
             detections = ML_ENGINE.detect_objects_yolo(str(temp_path))
             
             if detections:
-                # Аналіз кожного виявленого об'єкта
                 best_score = 0.0
                 img = cv2.imread(str(temp_path))
                 
-                for det in detections[:3]:  # Максимум 3 об'єкта
+                for det in detections[:3]:
                     bbox = det['bbox']
                     crop = img[int(bbox[1]):int(bbox[3]), 
                               int(bbox[0]):int(bbox[2])]
@@ -1271,7 +1120,6 @@ class IndustrialMonitor:
                 temp_path.unlink(missing_ok=True)
                 return best_score
             else:
-                # Прямий аналіз
                 result = await CV_ENGINE.analyze(target['path'], str(temp_path))
                 temp_path.unlink(missing_ok=True)
                 return result['score']
@@ -1282,21 +1130,16 @@ class IndustrialMonitor:
             return 0.0
     
     async def _process_match(self, target: Dict, ad: Dict, similarity: float, context):
-        """Обробка знайденого збігу"""
-        # Збереження в історію
         await DB.add_match(target['id'], ad, similarity)
         
-        # Формування повідомлення
         is_replica = any(k in ad['title'].lower() for k in REPLICA_KEYWORDS)
         
-        # Отримання ринкової інформації
         price_value = float(re.sub(r'[^\d.]', '', ad['price'])) if ad['price'] != "—" else 0
         await DB.execute(
             'INSERT INTO market_intel (target_name, price, timestamp, source) VALUES (?, ?, ?, ?)',
             (target['name'], price_value, int(time.time()), ad['source'])
         )
         
-        # Розрахунок медіани
         market_data = await DB.fetch_all(
             'SELECT price FROM market_intel WHERE target_name = ? ORDER BY timestamp DESC LIMIT 100',
             (target['name'],)
@@ -1304,9 +1147,8 @@ class IndustrialMonitor:
         prices = [d['price'] for d in market_data if d['price'] > 0]
         median_price = np.median(prices) if prices else None
         
-        is_deal = median_price and price_value < median_price * 0.7
+        is_deal = median_price and price_value and price_value < median_price * 0.7
         
-        # Формування повідомлення
         caption = (
             f"🔥 <b>INDUSTRIAL MATCH FOUND</b>\n\n"
             f"🎯 <b>Target:</b> {target['name'][:50]}\n"
@@ -1328,7 +1170,6 @@ class IndustrialMonitor:
             caption = caption.replace("INDUSTRIAL MATCH FOUND", 
                                      "⚠️ REPLICA DETECTED ⚠️")
         
-        # Відправка
         try:
             if ad.get('images'):
                 await context.bot.send_photo(
@@ -1368,7 +1209,6 @@ class IndustrialBot:
         self._setup_handlers()
     
     def _setup_handlers(self):
-        """Реєстрація обробників"""
         self.app.add_handler(CommandHandler("start", self.cmd_start))
         self.app.add_handler(CommandHandler("stats", self.cmd_stats))
         self.app.add_handler(CommandHandler("train", self.cmd_train))
@@ -1379,17 +1219,11 @@ class IndustrialBot:
         self.app.add_error_handler(self.error_handler)
     
     async def post_init(self, app):
-        """Post-initialization"""
-        # Запуск веб-сервера
         await self._start_web_server()
-        
-        # Автозапуск моніторингу
         asyncio.create_task(self._auto_start_monitor())
-        
         log.info("✅ Industrial bot initialized")
     
     async def _start_web_server(self):
-        """Запуск промислового веб-дашборду"""
         app = web.Application()
         app.router.add_get('/', self.web_index)
         app.router.add_get('/api/stats', self.web_stats)
@@ -1403,12 +1237,10 @@ class IndustrialBot:
         log.info(f"🌐 Industrial dashboard: http://0.0.0.0:{CONFIG.PORT}")
     
     async def _auto_start_monitor(self):
-        """Автоматичний запуск моніторингу"""
         await asyncio.sleep(3)
         await MONITOR.start(ContextTypes.DEFAULT_TYPE(application=self.app))
     
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Головне меню"""
         if update.effective_user.id != CONFIG.ADMIN_CHAT_ID:
             await update.message.reply_text("⛔ Access denied")
             return
@@ -1444,12 +1276,8 @@ class IndustrialBot:
         )
     
     async def cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Детальна статистика"""
         targets = await DB.get_targets()
         history = await DB.fetch_all('SELECT COUNT(*) as count FROM search_history')
-        performance = await DB.fetch_all(
-            'SELECT * FROM performance ORDER BY timestamp DESC LIMIT 10'
-        )
         
         msg = (
             f"📈 <b>Industrial Statistics</b>\n\n"
@@ -1475,13 +1303,7 @@ class IndustrialBot:
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
     
     async def cmd_train(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Ручне тренування ML моделей"""
-        if update.callback_query:
-        await update.callback_query.message.reply_text("🧠 Starting AutoML training session...")
-    else:
-        # Замість простого update.message.reply_text використовуйте:
-msg = update.callback_query.message if update.callback_query else update.message
-await msg.reply_text(text, reply_markup=self._get_main_keyboard())
+        msg = await update.message.reply_text("🧠 Training quality model...")
         
         success = await ML_ENGINE.train_quality_model()
         
@@ -1491,11 +1313,9 @@ await msg.reply_text(text, reply_markup=self._get_main_keyboard())
             await msg.edit_text("❌ Training failed - insufficient data")
     
     async def cmd_clean(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Очищення кешу"""
         CV_ENGINE.clear_cache()
         ML_ENGINE.embeddings_cache.clear()
         
-        # Очищення тимчасових файлів
         count = 0
         for f in CONFIG.CACHE_DIR.glob("*.jpg"):
             f.unlink(missing_ok=True)
@@ -1509,14 +1329,13 @@ await msg.reply_text(text, reply_markup=self._get_main_keyboard())
         )
     
     async def callback_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обробка callback-запитів"""
         q = update.callback_query
         await q.answer()
         data = q.data
         
         if data == "sync_empress":
             await q.edit_message_text("⏳ Scanning empress.cc ...")
-            added = await scan_empress_all()
+            added = await self.sync_empress()
             await q.edit_message_text(f"✅ Empress sync complete!\nAdded: {added} targets")
         
         elif data == "targets_list":
@@ -1536,9 +1355,7 @@ await msg.reply_text(text, reply_markup=self._get_main_keyboard())
         
         elif data == "add_target":
             context.user_data["state"] = "wait_img"
-            await q.edit_message_text(
-                "📸 Send photo of the target item"
-            )
+            await q.edit_message_text("📸 Send photo of the target item")
         
         elif data == "monitor_start":
             await MONITOR.start(context)
@@ -1561,10 +1378,11 @@ await msg.reply_text(text, reply_markup=self._get_main_keyboard())
                 [InlineKeyboardButton("🔧 Config", callback_data="config")],
                 [InlineKeyboardButton("◀️ Back", callback_data="back")]
             ]
-            if update.callback_query:
-        await update.callback_query.message.reply_text(text, reply_markup=self._get_main_keyboard(), parse_mode='HTML')
-    else:
-        await update.message.reply_text(text, reply_markup=self._get_main_keyboard(), parse_mode='HTML')
+            await q.edit_message_text(
+                "⚙️ <b>Advanced Settings</b>",
+                reply_markup=InlineKeyboardMarkup(kb),
+                parse_mode=ParseMode.HTML
+            )
         
         elif data == "clean_cache":
             CV_ENGINE.clear_cache()
@@ -1574,7 +1392,6 @@ await msg.reply_text(text, reply_markup=self._get_main_keyboard())
             await self.cmd_start(update, context)
     
     async def _show_targets(self, q):
-        """Показати список цілей"""
         targets = await DB.get_targets()
         
         if not targets:
@@ -1601,7 +1418,6 @@ await msg.reply_text(text, reply_markup=self._get_main_keyboard())
         )
     
     async def _target_delete_confirm(self, q):
-        """Підтвердження видалення"""
         tid = q.data.replace("target_del_", "")
         target = await DB.fetch_one('SELECT * FROM targets WHERE id = ?', (tid,))
         
@@ -1626,15 +1442,12 @@ await msg.reply_text(text, reply_markup=self._get_main_keyboard())
         )
     
     async def _target_delete_yes(self, q):
-        """Власне видалення"""
         tid = q.data.replace("target_del_yes_", "")
         
-        # Видаляємо файл
         target = await DB.fetch_one('SELECT path FROM targets WHERE id = ?', (tid,))
         if target and os.path.exists(target['path']):
             os.remove(target['path'])
         
-        # Видаляємо з БД
         await DB.execute('DELETE FROM targets WHERE id = ?', (tid,))
         await DB.execute('DELETE FROM search_history WHERE target_id = ?', (tid,))
         
@@ -1643,7 +1456,6 @@ await msg.reply_text(text, reply_markup=self._get_main_keyboard())
         await self._show_targets(q)
     
     async def _targets_clear_all(self, q):
-        """Підтвердження видалення всіх"""
         targets = await DB.get_targets()
         
         kb = [
@@ -1661,21 +1473,18 @@ await msg.reply_text(text, reply_markup=self._get_main_keyboard())
         )
     
     async def _targets_clear_confirm(self, q):
-        """Видалення всіх цілей"""
-        # Видаляємо файли
         targets = await DB.get_targets()
+        
         for t in targets:
             if os.path.exists(t['path']):
                 os.remove(t['path'])
         
-        # Очищаємо БД
         await DB.execute('DELETE FROM targets')
         await DB.execute('DELETE FROM search_history')
         
         await q.edit_message_text("✅ All targets deleted")
     
     async def handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обробка фото для додавання цілі"""
         if context.user_data.get("state") != "wait_img":
             return
         
@@ -1698,7 +1507,6 @@ await msg.reply_text(text, reply_markup=self._get_main_keyboard())
             await update.message.reply_text("❌ Failed to save photo")
     
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обробка назви для нової цілі"""
         if context.user_data.get("state") == "wait_name":
             name = update.message.text.strip()
             tmp_path = context.user_data.get("tmp_p")
@@ -1708,7 +1516,6 @@ await msg.reply_text(text, reply_markup=self._get_main_keyboard())
                 context.user_data.clear()
                 return
             
-            # Додаємо в БД
             target = {
                 'id': f"MAN_{secrets.token_hex(4)}",
                 'name': name,
@@ -1726,11 +1533,140 @@ await msg.reply_text(text, reply_markup=self._get_main_keyboard())
             await update.message.reply_text(f"✅ Target '{name}' added!")
     
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Глобальний обробник помилок"""
         log.error(f"Update {update} caused error {context.error}")
     
+    async def sync_empress(self) -> int:
+        """Промисловий сканер Empress.cc: інтегрований скан усіх категорій"""
+        added = 0
+        
+        urls = [
+            "https://empress.cc/collections/gents-vintage-watches?sort_by=price-ascending",
+            "https://empress.cc/collections/pocket-watches?sort_by=price-descending",
+            "https://empress.cc/collections/ladies-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/omega-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/vintage-enamel-watches?sort_by=price-descending",
+            "https://empress.cc/collections/40s-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/diamond-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/50s-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/60s-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/70s-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/solid-gold-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/high-end-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/art-deco-watches?sort_by=price-descending",
+            "https://empress.cc/collections/military-style-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/gruen-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/bulova-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/hamilton-usa-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/swiss-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/american-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/stainless-steel-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/vintage-chronographs?sort_by=price-descending",
+            "https://empress.cc/collections/gold-filled-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/post-70s-mechanical-watches?sort_by=price-descending",
+            "https://empress.cc/collections/borel-cocktail?sort_by=price-descending",
+            "https://empress.cc/collections/all-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/new-arrivals?sort_by=price-descending",
+            "https://empress.cc/collections/pendant-ball-watches?sort_by=price-descending",
+            "https://empress.cc/collections/cylinder-pocket-watches?sort_by=price-descending",
+            "https://empress.cc/collections/vintage-iwc-watches?sort_by=price-descending",
+            "https://empress.cc/collections/lady-gold-watches?sort_by=price-ascending",
+            "https://empress.cc/collections/the-virginia-pocket-watch-collection?sort_by=price-descending",
+            "https://empress.cc/collections/goliath-pocket-watches?sort_by=price-descending",
+            "https://empress.cc/collections/up-to-500-cash-us?sort_by=price-descending"
+        ]
+
+        log.info(f"🚀 Starting Empress industrial sync: {len(urls)} categories")
+        
+        current_targets = await DB.get_targets()
+        existing_urls = {t.get('source_url') for t in current_targets if t.get('source_url')}
+
+        async with aiohttp.ClientSession() as session:
+            for base_url in urls:
+                page = 1
+                log.info(f"Scanning category: {base_url.split('/')[-1].split('?')[0]}")
+                
+                while page <= 3:
+                    current_url = f"{base_url}&page={page}" if "?" in base_url else f"{base_url}?page={page}"
+                    
+                    try:
+                        headers = {'User-Agent': UserAgent().random}
+                        async with session.get(current_url, headers=headers, timeout=20) as resp:
+                            if resp.status != 200:
+                                break
+                            
+                            html = await resp.text()
+                            soup = BeautifulSoup(html, 'lxml')
+                            
+                            cards = soup.select('.product-card, .grid-view-item, .product-item')
+                            if not cards:
+                                break
+
+                            for card in cards:
+                                try:
+                                    title_elem = card.select_one('.product-card__title, .h4, .product-item__title')
+                                    price_elem = card.select_one('.price-item, .product-card__price, .price')
+                                    img_elem = card.select_one('img')
+                                    link_elem = card.select_one('a[href*="/products/"]')
+
+                                    if not (title_elem and link_elem):
+                                        continue
+
+                                    prod_url = "https://empress.cc" + link_elem['href']
+                                    if prod_url in existing_urls:
+                                        continue
+
+                                    img_url = ""
+                                    if img_elem:
+                                        img_url = img_elem.get('data-src') or img_elem.get('src') or ""
+                                        if img_url.startswith('//'):
+                                            img_url = 'https:' + img_url
+                                        img_url = img_url.replace('{width}', '800')
+
+                                    local_path = ""
+                                    if img_url:
+                                        try:
+                                            async with session.get(img_url, headers=headers) as img_resp:
+                                                if img_resp.status == 200:
+                                                    img_bytes = await img_resp.read()
+                                                    filename = f"emp_{secrets.token_hex(6)}.jpg"
+                                                    save_path = CONFIG.TARGETS_DIR / filename
+                                                    async with aiofiles.open(save_path, 'wb') as f:
+                                                        await f.write(img_bytes)
+                                                    local_path = str(save_path)
+                                        except:
+                                            pass
+
+                                    target = {
+                                        'id': f"EMP_{hashlib.md5(prod_url.encode()).hexdigest()[:8]}",
+                                        'name': title_elem.get_text(strip=True),
+                                        'path': local_path or prod_url,
+                                        'source': 'empress',
+                                        'source_url': prod_url,
+                                        'price': float(''.join(c for c in price_elem.text if c.isdigit())) if price_elem else 0,
+                                        'created': int(time.time()),
+                                        'priority': 1,
+                                        'tags': json.dumps(['watch', 'empress']),
+                                        'metadata': json.dumps({'category_url': base_url})
+                                    }
+
+                                    if await DB.add_target(target):
+                                        added += 1
+                                        existing_urls.add(prod_url)
+
+                                except Exception as e:
+                                    continue
+
+                            page += 1
+                            await asyncio.sleep(0.5)
+                            
+                    except Exception as e:
+                        log.error(f"Error on page {page} of {base_url}: {e}")
+                        break
+
+        log.info(f"✅ Sync complete! Added {added} new Empress watches.")
+        return added
+    
     async def web_index(self, request):
-        """Web dashboard"""
         targets = await DB.get_targets()
         stats = MONITOR.stats
         
@@ -1832,7 +1768,6 @@ await msg.reply_text(text, reply_markup=self._get_main_keyboard())
         return web.Response(text=html, content_type='text/html')
     
     async def web_stats(self, request):
-        """API endpoint для статистики"""
         targets = await DB.get_targets()
         history = await DB.fetch_all('SELECT COUNT(*) as count FROM search_history')
         
@@ -1849,12 +1784,10 @@ await msg.reply_text(text, reply_markup=self._get_main_keyboard())
         })
     
     async def web_targets(self, request):
-        """API endpoint для цілей"""
         targets = await DB.get_targets()
         return web.json_response(targets)
     
     def run(self):
-        """Запуск бота"""
         print("""
         ╔══════════════════════════════════════════════════════════╗
         ║     CollectorBot Industrial v30.0                       ║
@@ -1866,147 +1799,6 @@ await msg.reply_text(text, reply_markup=self._get_main_keyboard())
         log.info("🚀 Starting Industrial Collector...")
         self.app.run_polling(drop_pending_updates=True)
 
-# ============================================================================
-# [9] EMPRESS SCANNER (ІНТЕГРОВАНИЙ)
-# ============================================================================
-
-async def sync_empress(self) -> int:
-        """Промисловий сканер Empress.cc: інтегрований скан усіх категорій"""
-        added = 0
-        
-        # 1. Список усіх цільових категорій
-        urls = [
-            "https://empress.cc/collections/gents-vintage-watches?sort_by=price-ascending",
-            "https://empress.cc/collections/pocket-watches?sort_by=price-descending",
-            "https://empress.cc/collections/ladies-vintage-watches?sort_by=price-descending",
-            "https://empress.cc/collections/omega-vintage-watches?sort_by=price-descending",
-            "https://empress.cc/collections/vintage-enamel-watches?sort_by=price-descending",
-            "https://empress.cc/collections/40s-vintage-watches?sort_by=price-descending",
-            "https://empress.cc/collections/diamond-vintage-watches?sort_by=price-descending",
-            "https://empress.cc/collections/50s-vintage-watches?sort_by=price-descending",
-            "https://empress.cc/collections/60s-vintage-watches?sort_by=price-descending",
-            "https://empress.cc/collections/70s-vintage-watches?sort_by=price-descending",
-            "https://empress.cc/collections/solid-gold-vintage-watches?sort_by=price-descending",
-            "https://empress.cc/collections/high-end-vintage-watches?sort_by=price-descending",
-            "https://empress.cc/collections/art-deco-watches?sort_by=price-descending",
-            "https://empress.cc/collections/military-style-vintage-watches?sort_by=price-descending",
-            "https://empress.cc/collections/gruen-vintage-watches?sort_by=price-descending",
-            "https://empress.cc/collections/bulova-vintage-watches?sort_by=price-descending",
-            "https://empress.cc/collections/hamilton-usa-vintage-watches?sort_by=price-descending",
-            "https://empress.cc/collections/swiss-vintage-watches?sort_by=price-descending",
-            "https://empress.cc/collections/american-vintage-watches?sort_by=price-descending",
-            "https://empress.cc/collections/stainless-steel-vintage-watches?sort_by=price-descending",
-            "https://empress.cc/collections/vintage-chronographs?sort_by=price-descending",
-            "https://empress.cc/collections/gold-filled-vintage-watches?sort_by=price-descending",
-            "https://empress.cc/collections/post-70s-mechanical-watches?sort_by=price-descending",
-            "https://empress.cc/collections/borel-cocktail?sort_by=price-descending",
-            "https://empress.cc/collections/all-vintage-watches?sort_by=price-descending",
-            "https://empress.cc/collections/new-arrivals?sort_by=price-descending",
-            "https://empress.cc/collections/pendant-ball-watches?sort_by=price-descending",
-            "https://empress.cc/collections/cylinder-pocket-watches?sort_by=price-descending",
-            "https://empress.cc/collections/vintage-iwc-watches?sort_by=price-descending",
-            "https://empress.cc/collections/lady-gold-watches?sort_by=price-ascending",
-            "https://empress.cc/collections/the-virginia-pocket-watch-collection?sort_by=price-descending",
-            "https://empress.cc/collections/goliath-pocket-watches?sort_by=price-descending",
-            "https://empress.cc/collections/up-to-500-cash-us?sort_by=price-descending"
-        ]
-
-        log.info(f"🚀 Starting Empress industrial sync: {len(urls)} categories")
-        
-        # Отримуємо вже існуючі URL, щоб не дублювати
-        current_targets = await DB.get_targets()
-        existing_urls = {t.get('source_url') for t in current_targets if t.get('source_url')}
-
-        async with aiohttp.ClientSession() as session:
-            for base_url in urls:
-                page = 1
-                log.info(f"Scanning category: {base_url.split('/')[-1].split('?')[0]}")
-                
-                while page <= 3:  # Глибина сканування — 3 сторінки кожної категорії
-                    current_url = f"{base_url}&page={page}" if "?" in base_url else f"{base_url}?page={page}"
-                    
-                    try:
-                        headers = {'User-Agent': UserAgent().random}
-                        async with session.get(current_url, headers=headers, timeout=20) as resp:
-                            if resp.status != 200:
-                                break
-                            
-                            html = await resp.text()
-                            soup = BeautifulSoup(html, 'lxml')
-                            
-                            # Селектори під Shopify (Empress.cc використовує стандартні класи Shopify)
-                            cards = soup.select('.product-card, .grid-view-item, .product-item')
-                            if not cards:
-                                break
-
-                            for card in cards:
-                                try:
-                                    title_elem = card.select_one('.product-card__title, .h4, .product-item__title')
-                                    price_elem = card.select_one('.price-item, .product-card__price, .price')
-                                    img_elem = card.select_one('img')
-                                    link_elem = card.select_one('a[href*="/products/"]')
-
-                                    if not (title_elem and link_elem):
-                                        continue
-
-                                    prod_url = "https://empress.cc" + link_elem['href']
-                                    if prod_url in existing_urls:
-                                        continue
-
-                                    # Обробка зображення
-                                    img_url = ""
-                                    if img_elem:
-                                        img_url = img_elem.get('data-src') or img_elem.get('src') or ""
-                                        if img_url.startswith('//'):
-                                            img_url = 'https:' + img_url
-                                        # Заміна шаблонів розмірів Shopify {width}x
-                                        img_url = img_url.replace('{width}', '800')
-
-                                    # Завантаження картинки локально
-                                    local_path = ""
-                                    if img_url:
-                                        try:
-                                            async with session.get(img_url, headers=headers) as img_resp:
-                                                if img_resp.status == 200:
-                                                    img_bytes = await img_resp.read()
-                                                    filename = f"emp_{secrets.token_hex(6)}.jpg"
-                                                    save_path = CONFIG.TARGETS_DIR / filename
-                                                    async with aiofiles.open(save_path, 'wb') as f:
-                                                        await f.write(img_bytes)
-                                                    local_path = str(save_path)
-                                        except:
-                                            pass
-
-                                    # Формування об'єкта цілі
-                                    target = {
-                                        'id': f"EMP_{hashlib.md5(prod_url.encode()).hexdigest()[:8]}",
-                                        'name': title_elem.get_text(strip=True),
-                                        'path': local_path or prod_url,
-                                        'source': 'empress',
-                                        'source_url': prod_url,
-                                        'price': float(''.join(c for c in price_elem.text if c.isdigit())) if price_elem else 0,
-                                        'created': int(time.time()),
-                                        'priority': 1,
-                                        'tags': json.dumps(['watch', 'empress']),
-                                        'metadata': json.dumps({'category_url': base_url})
-                                    }
-
-                                    if await DB.add_target(target):
-                                        added += 1
-                                        existing_urls.add(prod_url)
-
-                                except Exception as e:
-                                    continue
-
-                            page += 1
-                            await asyncio.sleep(0.5) # Пауза щоб не забанили IP
-                            
-                    except Exception as e:
-                        log.error(f"Error on page {page} of {base_url}: {e}")
-                        break
-
-        log.info(f"✅ Sync complete! Added {added} new Empress watches.")
-        return added
 # ============================================================================
 # [10] MAIN
 # ============================================================================
