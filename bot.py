@@ -141,6 +141,8 @@ class AutoConfig:
         self.LOGS_DIR = self.DATA_DIR / "logs"
         self.TARGETS_DIR = self.DATA_DIR / "targets"
         self.DATASET_DIR = self.DATA_DIR / "dataset"
+        # Додайте це всередину класу Config
+        self.EMPRESS_COLLECTION = "https://empress.com/collection" # Або ваше посилання
         
         for d in [self.DATA_DIR, self.MODELS_DIR, self.CACHE_DIR, 
                   self.LOGS_DIR, self.TARGETS_DIR, self.DATASET_DIR]:
@@ -1106,7 +1108,8 @@ class IndustrialMonitor:
                 # Пакетна обробка
                 tasks = [
                     self._process_target(target, context)
-                    for target in batch
+                    for i in range(0, len(images), CONFIG.BATCH_SIZE):
+                    batch = images[i:i + CONFIG.BATCH_SIZE]
                 ]
                 
                 results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1447,7 +1450,10 @@ class IndustrialBot:
     
     async def cmd_train(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Ручне тренування ML моделей"""
-        msg = await update.message.reply_text("🧠 Training quality model...")
+        if update.callback_query:
+        await update.callback_query.message.reply_text("🧠 Starting AutoML training session...")
+    else:
+        await update.message.reply_text("🧠 Starting AutoML training session...")
         
         success = await ML_ENGINE.train_quality_model()
         
@@ -1527,11 +1533,10 @@ class IndustrialBot:
                 [InlineKeyboardButton("🔧 Config", callback_data="config")],
                 [InlineKeyboardButton("◀️ Back", callback_data="back")]
             ]
-            await q.edit_message_text(
-                "⚙️ <b>Advanced Settings</b>",
-                reply_markup=InlineKeyboardMarkup(kb),
-                parse_mode=ParseMode.HTML
-            )
+            if update.callback_query:
+        await update.callback_query.message.reply_text(text, reply_markup=self._get_main_keyboard(), parse_mode='HTML')
+    else:
+        await update.message.reply_text(text, reply_markup=self._get_main_keyboard(), parse_mode='HTML')
         
         elif data == "clean_cache":
             CV_ENGINE.clear_cache()
