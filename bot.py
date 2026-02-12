@@ -1105,13 +1105,21 @@ class IndustrialMonitor:
                 # Вибірка для поточного батчу
                 batch = targets[:CONFIG.BATCH_SIZE]
                 
-                ## Правильна пакетна обробка
-        tasks = []
-        for i in range(0, len(images), CONFIG.BATCH_SIZE):
-            batch = images[i:i + CONFIG.BATCH_SIZE]
-            # Додаємо завдання для обробки конкретного пакету
-            task = self.vision.process_batch(batch, target) 
-            tasks.append(task)
+                async def _process_target(self, target, context):
+        try:
+            images = await self._get_target_images(target)
+            if not images:
+                return
+
+            tasks = []
+            for i in range(0, len(images), CONFIG.BATCH_SIZE):
+                batch = images[i:i + CONFIG.BATCH_SIZE]
+                tasks.append(self.vision.process_batch(batch, target))
+            
+            await asyncio.gather(*tasks, return_exceptions=True)
+            
+        except Exception as e:
+            log.error(f"Processing error: {e}")
         
         # Запускаємо всі пакети одночасно
         results = await asyncio.gather(*tasks, return_exceptions=True)
