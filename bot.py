@@ -1105,15 +1105,16 @@ class IndustrialMonitor:
                 # Вибірка для поточного батчу
                 batch = targets[:CONFIG.BATCH_SIZE]
                 
-                # Пакетна обробка
-                tasks = [
-                    self._process_target(target, context)
-                    for i in range(0, len(images), CONFIG.BATCH_SIZE):
+                ## Правильна пакетна обробка
+        tasks = []
+        for i in range(0, len(images), CONFIG.BATCH_SIZE):
             batch = images[i:i + CONFIG.BATCH_SIZE]
-                ]
-                
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                
+            # Додаємо завдання для обробки конкретного пакету
+            task = self.vision.process_batch(batch, target) 
+            tasks.append(task)
+        
+        # Запускаємо всі пакети одночасно
+        results = await asyncio.gather(*tasks, return_exceptions=True)
                 # Аналіз результатів
                 for target, result in zip(batch, results):
                     if isinstance(result, Exception):
@@ -1844,91 +1845,143 @@ await msg.reply_text(text, reply_markup=self._get_main_keyboard())
 # [9] EMPRESS SCANNER (ІНТЕГРОВАНИЙ)
 # ============================================================================
 
-async def scan_empress_all():
-    """Промисловий сканер Empress.cc"""
-    page = 1
-    added = 0
-    targets = await DB.get_targets()
-    existing_urls = {t.get('source_url') for t in targets if t.get('source_url')}
-    
-    async with aiohttp.ClientSession() as session:
-        while True:
-            url = EMPRESS_COLLECTION + EMPRESS_PAGE_PARAM.format(page)
-            
-            try:
-                headers = {'User-Agent': UserAgent().random}
-                async with session.get(url, headers=headers, timeout=30) as resp:
-                    if resp.status != 200:
-                        break
-                    html = await resp.text()
-                
-                soup = BeautifulSoup(html, 'lxml')
-                cards = soup.select('div.product-item')
-                
-                if not cards:
-                    break
-                
-                for card in cards:
-                    try:
-                        title_elem = card.select_one('a.product-item__title')
-                        price_elem = card.select_one('.price')
-                        img_elem = card.select_one('img')
-                        link_elem = card.select_one('a')
-                        
-                        if not all([title_elem, img_elem, link_elem]):
-                            continue
-                        
-                        title = title_elem.text.strip()
-                        url = EMPRESS_BASE + link_elem['href']
-                        
-                        if url in existing_urls:
-                            continue
-                        
-                        img_url = img_elem.get('src') or img_elem.get('data-src')
-                        if img_url and img_url.startswith('//'):
-                            img_url = 'https:' + img_url
-                        
-                        # Завантаження зображення
-                        async with session.get(img_url, headers=headers) as img_resp:
-                            img_bytes = await img_resp.read()
-                        
-                        filename = f"empress_{secrets.token_hex(8)}.jpg"
-                        path = CONFIG.TARGETS_DIR / filename
-                        
-                        async with aiofiles.open(path, 'wb') as f:
-                            await f.write(img_bytes)
-                        
-                        # Додавання в БД
-                        target = {
-                            'id': f"EMP_{secrets.token_hex(4)}",
-                            'name': title,
-                            'path': str(path),
-                            'source': 'empress',
-                            'source_url': url,
-                            'price': float(''.join(c for c in price_elem.text if c.isdigit())) if price_elem else 0,
-                            'created': int(time.time()),
-                            'priority': 2,
-                            'tags': json.dumps(['empress']),
-                            'metadata': json.dumps({})
-                        }
-                        
-                        await DB.add_target(target)
-                        added += 1
-                        
-                    except Exception as e:
-                        log.debug(f"Empress card error: {e}")
-                        continue
-                
-                page += 1
-                await asyncio.sleep(1)
-                
-            except Exception as e:
-                log.error(f"Empress scan error: {e}")
-                break
-    
-    log.info(f"✅ Empress scan complete: +{added} targets")
-    return added
+async def sync_empress(self) -> int:
+        """Промисловий сканер Empress.cc: інтегрований скан усіх категорій"""
+        added = 0
+        
+        # 1. Список усіх цільових категорій
+        urls = [
+            "https://empress.cc/collections/gents-vintage-watches?sort_by=price-ascending",
+            "https://empress.cc/collections/pocket-watches?sort_by=price-descending",
+            "https://empress.cc/collections/ladies-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/omega-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/vintage-enamel-watches?sort_by=price-descending",
+            "https://empress.cc/collections/40s-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/diamond-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/50s-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/60s-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/70s-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/solid-gold-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/high-end-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/art-deco-watches?sort_by=price-descending",
+            "https://empress.cc/collections/military-style-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/gruen-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/bulova-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/hamilton-usa-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/swiss-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/american-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/stainless-steel-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/vintage-chronographs?sort_by=price-descending",
+            "https://empress.cc/collections/gold-filled-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/post-70s-mechanical-watches?sort_by=price-descending",
+            "https://empress.cc/collections/borel-cocktail?sort_by=price-descending",
+            "https://empress.cc/collections/all-vintage-watches?sort_by=price-descending",
+            "https://empress.cc/collections/new-arrivals?sort_by=price-descending",
+            "https://empress.cc/collections/pendant-ball-watches?sort_by=price-descending",
+            "https://empress.cc/collections/cylinder-pocket-watches?sort_by=price-descending",
+            "https://empress.cc/collections/vintage-iwc-watches?sort_by=price-descending",
+            "https://empress.cc/collections/lady-gold-watches?sort_by=price-ascending",
+            "https://empress.cc/collections/the-virginia-pocket-watch-collection?sort_by=price-descending",
+            "https://empress.cc/collections/goliath-pocket-watches?sort_by=price-descending",
+            "https://empress.cc/collections/up-to-500-cash-us?sort_by=price-descending"
+        ]
 
+        log.info(f"🚀 Starting Empress industrial sync: {len(urls)} categories")
+        
+        # Отримуємо вже існуючі URL, щоб не дублювати
+        current_targets = await DB.get_targets()
+        existing_urls = {t.get('source_url') for t in current_targets if t.get('source_url')}
+
+        async with aiohttp.ClientSession() as session:
+            for base_url in urls:
+                page = 1
+                log.info(f"Scanning category: {base_url.split('/')[-1].split('?')[0]}")
+                
+                while page <= 3:  # Глибина сканування — 3 сторінки кожної категорії
+                    current_url = f"{base_url}&page={page}" if "?" in base_url else f"{base_url}?page={page}"
+                    
+                    try:
+                        headers = {'User-Agent': UserAgent().random}
+                        async with session.get(current_url, headers=headers, timeout=20) as resp:
+                            if resp.status != 200:
+                                break
+                            
+                            html = await resp.text()
+                            soup = BeautifulSoup(html, 'lxml')
+                            
+                            # Селектори під Shopify (Empress.cc використовує стандартні класи Shopify)
+                            cards = soup.select('.product-card, .grid-view-item, .product-item')
+                            if not cards:
+                                break
+
+                            for card in cards:
+                                try:
+                                    title_elem = card.select_one('.product-card__title, .h4, .product-item__title')
+                                    price_elem = card.select_one('.price-item, .product-card__price, .price')
+                                    img_elem = card.select_one('img')
+                                    link_elem = card.select_one('a[href*="/products/"]')
+
+                                    if not (title_elem and link_elem):
+                                        continue
+
+                                    prod_url = "https://empress.cc" + link_elem['href']
+                                    if prod_url in existing_urls:
+                                        continue
+
+                                    # Обробка зображення
+                                    img_url = ""
+                                    if img_elem:
+                                        img_url = img_elem.get('data-src') or img_elem.get('src') or ""
+                                        if img_url.startswith('//'):
+                                            img_url = 'https:' + img_url
+                                        # Заміна шаблонів розмірів Shopify {width}x
+                                        img_url = img_url.replace('{width}', '800')
+
+                                    # Завантаження картинки локально
+                                    local_path = ""
+                                    if img_url:
+                                        try:
+                                            async with session.get(img_url, headers=headers) as img_resp:
+                                                if img_resp.status == 200:
+                                                    img_bytes = await img_resp.read()
+                                                    filename = f"emp_{secrets.token_hex(6)}.jpg"
+                                                    save_path = CONFIG.TARGETS_DIR / filename
+                                                    async with aiofiles.open(save_path, 'wb') as f:
+                                                        await f.write(img_bytes)
+                                                    local_path = str(save_path)
+                                        except:
+                                            pass
+
+                                    # Формування об'єкта цілі
+                                    target = {
+                                        'id': f"EMP_{hashlib.md5(prod_url.encode()).hexdigest()[:8]}",
+                                        'name': title_elem.get_text(strip=True),
+                                        'path': local_path or prod_url,
+                                        'source': 'empress',
+                                        'source_url': prod_url,
+                                        'price': float(''.join(c for c in price_elem.text if c.isdigit())) if price_elem else 0,
+                                        'created': int(time.time()),
+                                        'priority': 1,
+                                        'tags': json.dumps(['watch', 'empress']),
+                                        'metadata': json.dumps({'category_url': base_url})
+                                    }
+
+                                    if await DB.add_target(target):
+                                        added += 1
+                                        existing_urls.add(prod_url)
+
+                                except Exception as e:
+                                    continue
+
+                            page += 1
+                            await asyncio.sleep(0.5) # Пауза щоб не забанили IP
+                            
+                    except Exception as e:
+                        log.error(f"Error on page {page} of {base_url}: {e}")
+                        break
+
+        log.info(f"✅ Sync complete! Added {added} new Empress watches.")
+        return added
 # ============================================================================
 # [10] MAIN
 # ============================================================================
