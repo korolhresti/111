@@ -414,12 +414,11 @@ class AutonomousMLEngine:
         
         # Ініціалізація моделей
         self._init_models()
-        self._load_or_train()
     
     def _init_models(self):
         """Оптимізована ініціалізація ML-моделей для Render"""
         # Визначаємо, чи ми в умовах обмеженої пам'яті
-        is_low_mem = CONFIG.RAM_GB < 1.5
+        is_low_mem = CONFIG.RAM_GB < 2.0
 
         # 1. Семантичний енкодер (Оптимізовано для Render)
         if CONFIG.USE_TORCH:
@@ -441,20 +440,20 @@ class AutonomousMLEngine:
             del base_model
             gc.collect()
 
-        # 2. Класифікатор якості (Зменшуємо кількість n_estimators)
+        # 2. Класифікатор якості
         self.models['quality'] = RandomForestRegressor(
-            n_estimators=50 if is_low_mem else 100,
-            max_depth=7 if is_low_mem else 10,
+            n_estimators=50,
+            max_depth=7,
             random_state=42,
-            n_jobs=1 # На Render Free краще 1 потік
+            n_jobs=1  # Було CONFIG.CPU_COUNT
         )
         
-        # 3. Детектор аномалій (Полегшена версія)
+        # 3. Детектор аномалій
         self.models['anomaly'] = IsolationForest(
-            n_estimators=50 if is_low_mem else 100,
+            n_estimators=50,
             contamination=0.1,
             random_state=42,
-            n_jobs=1
+            n_jobs=1  # Було CONFIG.CPU_COUNT
         )
         
         # 4. Кластеризатор
