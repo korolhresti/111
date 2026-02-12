@@ -92,10 +92,21 @@ class AutoConfig:
         self.MAX_WORKERS = max(1, self.CPU_COUNT - 1)
         
         # Параметри AI
-        self.USE_TORCH = torch.cuda.is_available() or self.RAM_GB > 8
-        self.YOLO_MODEL = "yolov8m.pt" if self.RAM_GB > 4 else "yolov8n.pt"
-        self.EMBEDDING_MODEL = "resnet50" if self.RAM_GB > 6 else "resnet18"
+
+        # Визначаємо потужність системи (Render Free = 0.5GB RAM)
+        # Якщо RAM_GB не визначився правильно, краще занизити можливості, ніж отримати Crash
+        is_low_mem = self.RAM_GB < 1.0 
+
+        self.USE_TORCH = torch.cuda.is_available() # На Render CPU зазвичай False
         
+        # Вибираємо найменші моделі для Render
+        self.YOLO_MODEL = "yolov8n.pt" if is_low_mem else ("yolov8m.pt" if self.RAM_GB > 4 else "yolov8n.pt")
+        self.EMBEDDING_MODEL = "resnet18" if is_low_mem else ("resnet50" if self.RAM_GB > 6 else "resnet18")
+        
+        # Обмежуємо кількість потоків Torch, щоб не роздувати RAM
+        if is_low_mem:
+            torch.set_num_threads(1)
+            
         # Шляхи
         self._init_paths()
         self._validate()
@@ -406,41 +417,52 @@ class AutonomousMLEngine:
         self._load_or_train()
     
     def _init_models(self):
-        """Ініціалізація ML-моделей"""
-        # 1. Семантичний енкодер (ResNet50)
+        """Оптимізована ініціалізація ML-моделей для Render"""
+        # Визначаємо, чи ми в умовах обмеженої пам'яті
+        is_low_mem = CONFIG.RAM_GB < 1.5
+
+        # 1. Семантичний енкодер (Переходимо на ResNet18 для економії RAM)
         if CONFIG.USE_TORCH:
-            self.models['encoder'] = models.resnet50(pretrained=True).to(self.device).eval()
-            self.models['encoder'] = torch.nn.Sequential(*list(self.models['encoder'].children())[:-1])
-        
-        # 2. Класифікатор якості (Random Forest)
+            from torchvision.models import ResNet18_Weights, ResNet50_Weights
+            
+            if is_low_mem:
+                log.info("📉 Low RAM detected: Using ResNet18 instead of ResNet50")
+                base_model = models.resnet18(weights=ResNet18_Weights.DEFAULT)
+            else:
+                base_model = models.resnet50(weights=ResNet50_Weights.DEFAULT)
+            
+            base_model.to(self.device).eval()
+            self.models['encoder'] = torch.nn.Sequential(*list(base_model.children())[:-1])
+            del base_model # Видаляємо тимчасову змінну для очищення пам'яті
+
+        # 2. Класифікатор якості (Зменшуємо кількість n_estimators)
         self.models['quality'] = RandomForestRegressor(
-            n_estimators=100,
-            max_depth=10,
+            n_estimators=50 if is_low_mem else 100,
+            max_depth=7 if is_low_mem else 10,
             random_state=42,
-            n_jobs=CONFIG.CPU_COUNT
+            n_jobs=1 # На Render Free краще 1 потік
         )
         
-        # 3. Детектор аномалій (Isolation Forest)
+        # 3. Детектор аномалій (Полегшена версія)
         self.models['anomaly'] = IsolationForest(
+            n_estimators=50 if is_low_mem else 100,
             contamination=0.1,
             random_state=42,
-            n_jobs=CONFIG.CPU_COUNT
+            n_jobs=1
         )
         
-        # 4. Кластеризатор (DBSCAN)
-        self.models['cluster'] = DBSCAN(eps=0.3, min_samples=3, n_jobs=CONFIG.CPU_COUNT)
+        # 4. Кластеризатор
+        self.models['cluster'] = DBSCAN(eps=0.3, min_samples=3, n_jobs=1)
         
-        # 5. YOLO детектор
+        # 5. YOLO детектор (Використовуємо ТІЛЬКИ Nano версію)
+        # CONFIG.YOLO_MODEL має бути "yolov8n.pt"
         self.models['yolo'] = YOLO(CONFIG.YOLO_MODEL)
         
-        # 6. RT-DETR (якщо достатньо RAM)
-        if CONFIG.RAM_GB > 8:
-            try:
-                self.models['rtdetr'] = RTDETR('rtdetr-l.pt')
-            except:
-                pass
-    
-    def _load_or_train(self):
+        # 6. ОЧИЩЕННЯ ПАМ'ЯТІ (Критично важливо!)
+        import gc
+        gc.collect()
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
         """Завантаження або тренування моделей"""
         model_path = CONFIG.MODELS_DIR / 'quality_model.pkl'
         if model_path.exists():
@@ -1900,9 +1922,13 @@ async def scan_empress_all():
 # ============================================================================
 
 def main():
-    """Точка входу"""
-    bot = IndustrialBot()
-    bot.run()
+    try:
+        log.info("Starting bot...")
+        bot = IndustrialBot()
+        bot.run()
+    except Exception as e:
+        print(f"CRITICAL ERROR DURING STARTUP: {e}")
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
