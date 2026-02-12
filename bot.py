@@ -1106,28 +1106,38 @@ class IndustrialMonitor:
                 batch = targets[:CONFIG.BATCH_SIZE]
                 
     
+     async def _handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обробка натискань на кнопки"""
+        query = update.callback_query
+        await query.answer()
+        
+        if query.data == "sync":
+            added = await self.sync_empress()
+            await query.message.reply_text(f"✅ Синхронізація завершена! Додано: {added}")
+        
+        elif query.data == "stats":
+            await self.cmd_stats(update, context)
+
     async def _process_target(self, target, context):
+        """Пакетна обробка цілей нейромережею"""
         try:
-            # Отримання зображень (цей рядок має 8 пробілів від краю файлу)
             images = await self._get_target_images(target)
             if not images:
                 return
 
-            # Створення списку завдань для пакетної обробки
             tasks = []
             for i in range(0, len(images), CONFIG.BATCH_SIZE):
                 batch = images[i:i + CONFIG.BATCH_SIZE]
-                # Додаємо завдання обробки пакету нейромережею
+                # Створення завдання для обробки пакету
                 task = self.vision.process_batch(batch, target)
                 tasks.append(task)
             
-            # Запуск паралельного виконання
+            # Виконання всіх завдань
             await asyncio.gather(*tasks, return_exceptions=True)
             
         except Exception as e:
-            log.error(f"Error in _process_target: {e}")
-        finally:
-            log.info(f"Target processing cycle finished for {target.get('id')}")     
+            log.error(f"Error processing target {target.get('id')}: {e}")
+            
         # Запускаємо всі пакети одночасно
         results = await asyncio.gather(*tasks, return_exceptions=True)
                 # Аналіз результатів
