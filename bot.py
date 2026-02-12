@@ -1109,7 +1109,7 @@ class IndustrialMonitor:
                 tasks = [
                     self._process_target(target, context)
                     for i in range(0, len(images), CONFIG.BATCH_SIZE):
-                    batch = images[i:i + CONFIG.BATCH_SIZE]
+            batch = images[i:i + CONFIG.BATCH_SIZE]
                 ]
                 
                 results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1453,7 +1453,9 @@ class IndustrialBot:
         if update.callback_query:
         await update.callback_query.message.reply_text("🧠 Starting AutoML training session...")
     else:
-        await update.message.reply_text("🧠 Starting AutoML training session...")
+        # Замість простого update.message.reply_text використовуйте:
+msg = update.callback_query.message if update.callback_query else update.message
+await msg.reply_text(text, reply_markup=self._get_main_keyboard())
         
         success = await ML_ENGINE.train_quality_model()
         
