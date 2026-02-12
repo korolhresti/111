@@ -100,7 +100,7 @@ class AutoConfig:
         self.USE_TORCH = torch.cuda.is_available() # На Render CPU зазвичай False
         
         # Вибираємо найменші моделі для Render
-        self.YOLO_MODEL = "yolov8n.pt" if is_low_mem else ("yolov8m.pt" if self.RAM_GB > 4 else "yolov8n.pt")
+        self.YOLO_MODEL = "yolov8n.pt" # Force Nano version for Render stability
         self.EMBEDDING_MODEL = "resnet18" if is_low_mem else ("resnet50" if self.RAM_GB > 6 else "resnet18")
         
         # Обмежуємо кількість потоків Torch, щоб не роздувати RAM
@@ -421,9 +421,12 @@ class AutonomousMLEngine:
         # Визначаємо, чи ми в умовах обмеженої пам'яті
         is_low_mem = CONFIG.RAM_GB < 1.5
 
-        # 1. Семантичний енкодер (Переходимо на ResNet18 для економії RAM)
+        # 1. Семантичний енкодер (Оптимізовано для Render)
         if CONFIG.USE_TORCH:
             from torchvision.models import ResNet18_Weights, ResNet50_Weights
+            
+            # Примусово використовуємо ResNet18, якщо RAM менше 2ГБ
+            is_low_mem = CONFIG.RAM_GB < 2.0
             
             if is_low_mem:
                 log.info("📉 Low RAM detected: Using ResNet18 instead of ResNet50")
@@ -433,7 +436,10 @@ class AutonomousMLEngine:
             
             base_model.to(self.device).eval()
             self.models['encoder'] = torch.nn.Sequential(*list(base_model.children())[:-1])
-            del base_model # Видаляємо тимчасову змінну для очищення пам'яті
+            
+            # Очищення пам'яті після створення
+            del base_model
+            gc.collect()
 
         # 2. Класифікатор якості (Зменшуємо кількість n_estimators)
         self.models['quality'] = RandomForestRegressor(
