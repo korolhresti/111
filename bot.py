@@ -1105,22 +1105,29 @@ class IndustrialMonitor:
                 # Вибірка для поточного батчу
                 batch = targets[:CONFIG.BATCH_SIZE]
                 
-                async def _process_target(self, target, context):
+    
+    async def _process_target(self, target, context):
         try:
+            # Отримання зображень (цей рядок має 8 пробілів від краю файлу)
             images = await self._get_target_images(target)
             if not images:
                 return
 
+            # Створення списку завдань для пакетної обробки
             tasks = []
             for i in range(0, len(images), CONFIG.BATCH_SIZE):
                 batch = images[i:i + CONFIG.BATCH_SIZE]
-                tasks.append(self.vision.process_batch(batch, target))
+                # Додаємо завдання обробки пакету нейромережею
+                task = self.vision.process_batch(batch, target)
+                tasks.append(task)
             
+            # Запуск паралельного виконання
             await asyncio.gather(*tasks, return_exceptions=True)
             
         except Exception as e:
-            log.error(f"Processing error: {e}")
-        
+            log.error(f"Error in _process_target: {e}")
+        finally:
+            log.info(f"Target processing cycle finished for {target.get('id')}")     
         # Запускаємо всі пакети одночасно
         results = await asyncio.gather(*tasks, return_exceptions=True)
                 # Аналіз результатів
