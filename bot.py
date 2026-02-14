@@ -51,12 +51,11 @@ class Config:
         self.CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
         self.PORT = int(os.getenv("PORT", 8080))
         
-        # Налаштування пошуку
-        self.SIMILARITY_THRESHOLD = 0.70  # Знижуємо поріг для більшої кількості збігів
-        self.SCAN_INTERVAL = 180  # Скануємо кожні 3 хвилини
-        self.MAX_TARGETS_PER_SCAN = 10  # Більше цілей за раз
-        self.MAX_ADS_PER_TARGET = 30  # Більше оголошень на ціль
-        self.MAX_IMAGES_PER_AD = 5  # Більше фото на оголошення
+        # Налаштування пошуку - ПОСИЛЕНІ
+        self.SIMILARITY_THRESHOLD = 0.60  # Знижуємо поріг для більшої кількості збігів
+        self.SCAN_INTERVAL = 60  # Скануємо кожну ХВИЛИНУ
+        self.MAX_TARGETS_PER_SCAN = 20  # Більше цілей за раз
+        self.MAX_ADS_PER_TARGET = 50  # Більше оголошень на ціль
         self.SEARCH_PAGES = 3  # Кількість сторінок пошуку
         
         # Шляхи
@@ -73,7 +72,7 @@ class Config:
         
         # YOLO
         self.YOLO_MODEL = "yolov8n.pt"
-        self.YOLO_CONFIDENCE = 0.3  # Знижуємо поріг впевненості
+        self.YOLO_CONFIDENCE = 0.25  # Ще нижчий поріг
         
         self._validate()
     
@@ -91,34 +90,20 @@ CONFIG = Config()
 # [2] ЛОГУВАННЯ
 # ============================================================================
 
-class Logger:
-    def __init__(self):
-        self.logger = logging.getLogger("OLXMonitor")
-        self.logger.setLevel(logging.INFO)
-        
-        formatter = logging.Formatter(
-            '%(asctime)s | %(levelname)s | %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        )
-        
-        log_file = CONFIG.LOGS_DIR / "olx_monitor.log"
-        file_handler = logging.handlers.RotatingFileHandler(
-            log_file, maxBytes=10*1024*1024, backupCount=5
-        )
-        file_handler.setFormatter(formatter)
-        
-        console_handler = logging.StreamHandler()
-        console_handler.setFormatter(formatter)
-        
-        self.logger.addHandler(file_handler)
-        self.logger.addHandler(console_handler)
-    
-    def info(self, msg): self.logger.info(msg)
-    def error(self, msg): self.logger.error(msg)
-    def warning(self, msg): self.logger.warning(msg)
-    def debug(self, msg): self.logger.debug(msg)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+log = logging.getLogger("OLXMonitor")
 
-log = Logger()
+# Додаємо файловий логер
+log_file = CONFIG.LOGS_DIR / "olx_monitor.log"
+file_handler = logging.handlers.RotatingFileHandler(
+    log_file, maxBytes=10*1024*1024, backupCount=5
+)
+file_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s'))
+log.addHandler(file_handler)
 
 # ============================================================================
 # [3] БАЗА ДАНИХ
@@ -129,6 +114,7 @@ class Database:
         self.conn = sqlite3.connect(CONFIG.DB_PATH, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._init_db()
+        self.lock = asyncio.Lock()
     
     def _init_db(self):
         cursor = self.conn.cursor()
@@ -173,9 +159,10 @@ class Database:
         self.conn.commit()
     
     async def execute(self, query: str, params: tuple = ()):
-        return await asyncio.get_event_loop().run_in_executor(
-            None, self._sync_execute, query, params
-        )
+        async with self.lock:
+            return await asyncio.get_event_loop().run_in_executor(
+                None, self._sync_execute, query, params
+            )
     
     def _sync_execute(self, query, params):
         cursor = self.conn.cursor()
@@ -184,9 +171,10 @@ class Database:
         return cursor
     
     async def fetch_all(self, query: str, params: tuple = ()):
-        return await asyncio.get_event_loop().run_in_executor(
-            None, self._sync_fetch_all, query, params
-        )
+        async with self.lock:
+            return await asyncio.get_event_loop().run_in_executor(
+                None, self._sync_fetch_all, query, params
+            )
     
     def _sync_fetch_all(self, query, params):
         cursor = self.conn.cursor()
@@ -211,9 +199,10 @@ class Database:
                 target.get('created', int(time.time())),
                 target.get('priority', 1)
             ))
+            log.info(f"✅ Ціль додано: {target['name']}")
             return True
         except Exception as e:
-            log.error(f"DB add_target error: {e}")
+            log.error(f"❌ Помилка додавання цілі: {e}")
             return False
     
     async def get_targets(self) -> List[Dict]:
@@ -227,6 +216,7 @@ class Database:
             except: pass
         await self.execute('DELETE FROM targets WHERE id = ?', (target_id,))
         await self.execute('DELETE FROM seen_ads WHERE target_id = ?', (target_id,))
+        log.info(f"🗑 Ціль видалено: {target_id}")
     
     async def delete_all_targets(self):
         targets = await self.get_targets()
@@ -237,6 +227,7 @@ class Database:
                 except: pass
         await self.execute('DELETE FROM targets')
         await self.execute('DELETE FROM seen_ads')
+        log.info("🗑 Всі цілі видалено")
     
     async def is_ad_seen(self, ad_url: str) -> bool:
         result = await self.fetch_one('SELECT ad_url FROM seen_ads WHERE ad_url = ?', (ad_url,))
@@ -256,24 +247,30 @@ class Database:
                           (int(time.time()), target_id))
     
     async def add_match(self, target: Dict, ad: Dict, similarity: float, image_url: str = None):
-        query = '''
-            INSERT OR IGNORE INTO matches 
-            (target_id, target_name, ad_title, ad_price, ad_url, similarity, image_url, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        '''
-        await self.execute(query, (
-            target['id'],
-            target['name'],
-            ad['title'][:200],
-            ad['price'],
-            ad['url'],
-            similarity,
-            image_url or (ad.get('images', [])[0] if ad.get('images') else None),
-            int(time.time())
-        ))
-        
-        await self.update_target_stats(target['id'], found_match=True)
-        await self.mark_ad_seen(ad['url'], target['id'])
+        try:
+            query = '''
+                INSERT OR IGNORE INTO matches 
+                (target_id, target_name, ad_title, ad_price, ad_url, similarity, image_url, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            '''
+            await self.execute(query, (
+                target['id'],
+                target['name'],
+                ad['title'][:200],
+                ad['price'],
+                ad['url'],
+                similarity,
+                image_url or (ad.get('images', [])[0] if ad.get('images') else None),
+                int(time.time())
+            ))
+            
+            await self.update_target_stats(target['id'], found_match=True)
+            await self.mark_ad_seen(ad['url'], target['id'])
+            log.info(f"🔥 ЗБІГ! {target['name']} - {similarity:.1%}")
+            return True
+        except Exception as e:
+            log.error(f"❌ Помилка додавання збігу: {e}")
+            return False
     
     async def get_unsent_matches(self) -> List[Dict]:
         return await self.fetch_all(
@@ -350,6 +347,9 @@ class CVEngine:
         return (dct_low > median).flatten()
     
     def compare(self, path1: str, path2: str) -> float:
+        if not os.path.exists(path1) or not os.path.exists(path2):
+            return 0.0
+        
         cache_key = f"{path1}:{path2}"
         if cache_key in self.cache:
             return self.cache[cache_key]
@@ -360,43 +360,44 @@ class CVEngine:
         if img1 is None or img2 is None:
             return 0.0
         
-        img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
-        
-        # pHash
-        h1 = self._phash(img1)
-        h2 = self._phash(img2)
-        phash_score = 1.0 - (np.count_nonzero(h1 != h2) / len(h1))
-        
-        # SIFT
-        kp1, des1 = self.sift.detectAndCompute(img1, None)
-        kp2, des2 = self.sift.detectAndCompute(img2, None)
-        
-        sift_score = 0.0
-        if des1 is not None and des2 is not None and len(kp1) > 0 and len(kp2) > 0:
-            matches = self.bf.knnMatch(des1, des2, k=2)
-            good = []
-            for m, n in matches:
-                if m.distance < 0.75 * n.distance:
-                    good.append(m)
-            sift_score = len(good) / max(len(kp1), len(kp2), 1)
-        
-        # SSIM
-        gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
-        gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
         try:
+            img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
+            
+            # pHash
+            h1 = self._phash(img1)
+            h2 = self._phash(img2)
+            phash_score = 1.0 - (np.count_nonzero(h1 != h2) / len(h1))
+            
+            # SIFT
+            kp1, des1 = self.sift.detectAndCompute(img1, None)
+            kp2, des2 = self.sift.detectAndCompute(img2, None)
+            
+            sift_score = 0.0
+            if des1 is not None and des2 is not None and len(kp1) > 0 and len(kp2) > 0:
+                matches = self.bf.knnMatch(des1, des2, k=2)
+                good = []
+                for m, n in matches:
+                    if m.distance < 0.75 * n.distance:
+                        good.append(m)
+                sift_score = len(good) / max(len(kp1), len(kp2), 1)
+            
+            # SSIM
+            gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+            gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
             ssim_score = ssim(gray1, gray2)
-        except:
-            ssim_score = 0.5
-        
-        # Фінальний скор
-        final = (phash_score * 0.3 + sift_score * 0.4 + ssim_score * 0.3)
-        final = min(1.0, max(0.0, final))
-        
-        self.cache[cache_key] = final
-        if len(self.cache) > 1000:
-            self.cache.clear()
-        
-        return final
+            
+            # Фінальний скор
+            final = (phash_score * 0.3 + sift_score * 0.4 + ssim_score * 0.3)
+            final = min(1.0, max(0.0, final))
+            
+            self.cache[cache_key] = final
+            if len(self.cache) > 1000:
+                self.cache.clear()
+            
+            return final
+        except Exception as e:
+            log.debug(f"CV помилка: {e}")
+            return 0.0
     
     def clear_cache(self):
         self.cache.clear()
@@ -405,7 +406,7 @@ class CVEngine:
 cv_engine = CVEngine()
 
 # ============================================================================
-# [6] OLX ПАРСЕР - ПОСИЛЕНИЙ
+# [6] OLX ПАРСЕР
 # ============================================================================
 
 class OLXParser:
@@ -421,22 +422,21 @@ class OLXParser:
         return self.session
     
     async def search(self, query: str, pages: int = 3) -> List[Dict]:
-        """Посилений пошук по OLX з пагінацією"""
+        """Пошук по OLX з пагінацією"""
         session = await self.get_session()
         all_ads = []
         seen_urls = set()
         
         for page in range(1, pages + 1):
-            # Формуємо URL з пагінацією
-            if page == 1:
-                url = f"https://www.olx.ua/d/uk/list/q-{query.replace(' ', '-')}/"
-            else:
-                url = f"https://www.olx.ua/d/uk/list/q-{query.replace(' ', '-')}/?page={page}"
+            # Формуємо URL
+            url = f"https://www.olx.ua/d/uk/list/q-{query.replace(' ', '-')}/"
+            if page > 1:
+                url += f"?page={page}"
             
             try:
                 headers = {
                     'User-Agent': self.ua.random,
-                    'Accept-Language': 'uk-UA,uk;q=0.9,en;q=0.8,ru;q=0.7',
+                    'Accept-Language': 'uk-UA,uk;q=0.9,en;q=0.8',
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                     'Referer': 'https://www.olx.ua/'
                 }
@@ -450,32 +450,28 @@ class OLXParser:
                 
                 soup = BeautifulSoup(html, 'lxml')
                 
-                # Основні селектори для OLX
+                # Шукаємо картки
                 cards = soup.select('div[data-cy="l-card"]')
                 
                 if not cards:
-                    # Альтернативні селектори
-                    cards = soup.select('div.css-1apmciz, div.css-1sw7q4x, div.offer-wrapper')
+                    cards = soup.select('div.css-1apmciz, div.css-1sw7q4x')
                 
                 if not cards:
                     log.debug(f"Немає карток на сторінці {page}")
                     break
                 
-                log.info(f"📄 Сторінка {page}: знайдено {len(cards)} оголошень")
+                log.info(f"📄 Сторінка {page}: {len(cards)} оголошень")
                 
                 for card in cards:
                     try:
-                        # Пропускаємо TOP/VIP
-                        if card.select_one('[data-testid="adCard-featured"], .css-14nq1co, .featured'):
+                        # Пропускаємо TOP
+                        if card.select_one('[data-testid="adCard-featured"]'):
                             continue
                         
                         # Заголовок
-                        title_elem = (
-                            card.select_one('h6') or 
-                            card.select_one('a.css-1bbgabe') or 
-                            card.select_one('a[href*="/d/uk/"]') or
-                            card.select_one('a[class*="title"]')
-                        )
+                        title_elem = card.select_one('h6')
+                        if not title_elem:
+                            title_elem = card.select_one('a.css-1bbgabe')
                         
                         if not title_elem:
                             continue
@@ -485,28 +481,22 @@ class OLXParser:
                             continue
                         
                         # Посилання
-                        link_elem = title_elem if title_elem.name == 'a' else card.select_one('a[href]')
+                        link_elem = card.select_one('a[href]')
                         if not link_elem:
                             continue
                         
                         href = link_elem.get('href', '')
-                        if not href:
-                            continue
-                        
                         ad_url = href if href.startswith('http') else f"https://www.olx.ua{href}"
                         
-                        # Уникаємо дублікатів на сторінці
                         if ad_url in seen_urls:
                             continue
                         seen_urls.add(ad_url)
                         
                         # Ціна
-                        price_elem = (
-                            card.select_one('[data-testid="ad-price"]') or
-                            card.select_one('.css-10b0b6q') or
-                            card.select_one('.price') or
-                            card.select_one('[class*="price"]')
-                        )
+                        price_elem = card.select_one('[data-testid="ad-price"]')
+                        if not price_elem:
+                            price_elem = card.select_one('.css-10b0b6q')
+                        
                         price = price_elem.get_text(strip=True) if price_elem else "—"
                         
                         # Зображення
@@ -518,113 +508,122 @@ class OLXParser:
                                 if img_url.startswith('//'):
                                     img_url = 'https:' + img_url
                                 images.append(img_url)
-                                
-                                # Шукаємо додаткові зображення в галереї
-                                gallery_imgs = card.select('img[src*="images.olx.ua"]')
-                                for g_img in gallery_imgs[:4]:
-                                    g_url = g_img.get('src') or g_img.get('data-src')
-                                    if g_url and g_url not in images and not g_url.endswith('.svg'):
-                                        if g_url.startswith('//'):
-                                            g_url = 'https:' + g_url
-                                        images.append(g_url)
-                        
-                        # Перевіряємо чи це не сміття
-                        if len(title) < 5 or "ремонт" in title.lower() or "послуг" in title.lower():
-                            continue
                         
                         all_ads.append({
                             'title': title,
                             'price': price,
                             'url': ad_url,
-                            'images': images[:CONFIG.MAX_IMAGES_PER_AD],
+                            'images': images,
                             'page': page
                         })
                         
                     except Exception as e:
-                        log.debug(f"Помилка парсингу картки: {e}")
                         continue
                 
                 # Затримка між сторінками
                 if page < pages:
-                    await asyncio.sleep(random.uniform(2, 4))
+                    await asyncio.sleep(random.uniform(1, 3))
                 
             except Exception as e:
                 log.error(f"Помилка завантаження сторінки {page}: {e}")
                 break
         
-        log.info(f"✅ Знайдено всього {len(all_ads)} оголошень для '{query}'")
+        log.info(f"✅ Знайдено {len(all_ads)} оголошень для '{query}'")
         return all_ads[:CONFIG.MAX_ADS_PER_TARGET]
 
 olx = OLXParser()
 
 # ============================================================================
-# [7] МОНІТОРИНГ - ПОСИЛЕНИЙ
+# [7] МОНІТОРИНГ - ФІКСОВАНИЙ
 # ============================================================================
 
 class Monitor:
     def __init__(self):
         self.is_running = False
         self.task = None
-        self.stats = {'processed': 0, 'matches': 0, 'errors': 0, 'ads_checked': 0}
+        self.stats = {
+            'processed': 0, 
+            'matches': 0, 
+            'errors': 0, 
+            'ads_checked': 0
+        }
     
-    async def start(self, context):
+    async def start(self, app):
+        """Запуск моніторингу"""
         if self.is_running:
+            log.info("Моніторинг вже працює")
             return
+        
         self.is_running = True
-        self.task = asyncio.create_task(self._run(context))
+        # Створюємо задачу з правильним контекстом
+        self.task = asyncio.create_task(self._run(app))
         log.info("🚀 Моніторинг запущено")
+        return self.task
     
     async def stop(self):
+        """Зупинка моніторингу"""
         self.is_running = False
         if self.task:
             self.task.cancel()
             try:
                 await self.task
-            except:
+            except asyncio.CancelledError:
                 pass
+            except Exception as e:
+                log.error(f"Помилка при зупинці: {e}")
         log.info("🛑 Моніторинг зупинено")
     
-    async def _run(self, context):
+    async def _run(self, app):
+        """Головний цикл моніторингу"""
+        log.info("🔄 Запуск головного циклу моніторингу")
+        
         while self.is_running:
             try:
+                # Отримуємо цілі
                 targets = await DB.get_targets()
                 
                 if not targets:
+                    log.debug("Немає цілей для моніторингу")
                     await asyncio.sleep(30)
                     continue
                 
                 log.info(f"🎯 Починаємо сканування {len(targets)} цілей")
                 
-                for target in targets[:CONFIG.MAX_TARGETS_PER_SCAN]:
+                # Беремо пріоритетні цілі
+                targets_to_scan = targets[:CONFIG.MAX_TARGETS_PER_SCAN]
+                
+                for target in targets_to_scan:
                     try:
-                        await self._process_target(target, context)
+                        await self._process_target(target, app)
                         self.stats['processed'] += 1
-                        await asyncio.sleep(random.uniform(3, 6))
+                        # Коротка пауза між цілями
+                        await asyncio.sleep(random.uniform(2, 5))
                     except Exception as e:
                         self.stats['errors'] += 1
                         log.error(f"Помилка цілі {target['name']}: {e}")
                 
                 # Відправляємо знайдені матчі в канал
-                await self._send_pending_matches(context)
+                await self._send_pending_matches(app)
                 
                 log.info(f"⏳ Наступне сканування через {CONFIG.SCAN_INTERVAL} сек")
                 await asyncio.sleep(CONFIG.SCAN_INTERVAL)
                 
             except asyncio.CancelledError:
+                log.info("Моніторинг скасовано")
                 break
             except Exception as e:
-                log.error(f"Помилка моніторингу: {e}")
-                await asyncio.sleep(60)
+                log.error(f"Помилка в головному циклі: {e}")
+                await asyncio.sleep(30)
     
-    async def _process_target(self, target: Dict, context):
-        """Посилена обробка цілі"""
+    async def _process_target(self, target: Dict, app):
+        """Обробка однієї цілі"""
         if not os.path.exists(target['path']):
             log.warning(f"Фото цілі не знайдено: {target['path']}")
             return
         
         log.info(f"🔍 Скануємо: {target['name']}")
         
-        # Пошук по OLX з пагінацією
+        # Пошук по OLX
         ads = await olx.search(target['name'], pages=CONFIG.SEARCH_PAGES)
         
         if not ads:
@@ -632,7 +631,7 @@ class Monitor:
             await DB.update_target_stats(target['id'])
             return
         
-        # Фільтруємо вже переглянуті
+        # Фільтруємо нові оголошення
         new_ads = []
         for ad in ads:
             if not await DB.is_ad_seen(ad['url']):
@@ -640,16 +639,15 @@ class Monitor:
         
         log.info(f"📊 {target['name']}: {len(ads)} всього, {len(new_ads)} нових")
         
-        if not new_ads:
-            await DB.update_target_stats(target['id'])
-            return
-        
         # Аналізуємо нові оголошення
-        for ad in new_ads[:15]:  # Обмежуємо для швидкості
+        for ad in new_ads:
+            if not ad.get('images'):
+                continue
+            
             best_score = 0.0
             best_image = None
             
-            for img_url in ad.get('images', [])[:CONFIG.MAX_IMAGES_PER_AD]:
+            for img_url in ad['images'][:3]:  # Максимум 3 фото
                 score = await self._analyze_image(target['path'], img_url)
                 if score > best_score:
                     best_score = score
@@ -658,14 +656,13 @@ class Monitor:
             if best_score >= CONFIG.SIMILARITY_THRESHOLD:
                 await DB.add_match(target, ad, best_score, best_image)
                 self.stats['matches'] += 1
-                log.info(f"✅ ЗБІГ! {target['name']} - {best_score:.1%}")
             
             self.stats['ads_checked'] += 1
         
         await DB.update_target_stats(target['id'])
     
     async def _analyze_image(self, target_path: str, img_url: str) -> float:
-        """Аналіз зображення з YOLO"""
+        """Аналіз зображення"""
         if not img_url:
             return 0.0
         
@@ -678,50 +675,24 @@ class Monitor:
                     if resp.status != 200:
                         return 0.0
                     content = await resp.read()
-                    if len(content) < 1000:  # Занадто мале зображення
+                    if len(content) < 1000:
                         return 0.0
                     async with aiofiles.open(temp_path, 'wb') as f:
                         await f.write(content)
             
             # YOLO детекція
-            detections = yolo.detect(str(temp_path))
+            score = cv_engine.compare(target_path, str(temp_path))
             
-            if detections:
-                best_score = 0.0
-                img = cv2.imread(str(temp_path))
-                
-                if img is not None:
-                    for det in detections[:3]:
-                        bbox = det['bbox']
-                        x1, y1, x2, y2 = map(int, bbox)
-                        x1, y1 = max(0, x1), max(0, y1)
-                        x2, y2 = min(img.shape[1], x2), min(img.shape[0], y2)
-                        
-                        if x2 > x1 and y2 > y1:
-                            crop = img[y1:y2, x1:x2]
-                            
-                            if crop.size > 0:
-                                crop_path = CONFIG.CACHE_DIR / f"crop_{secrets.token_hex(6)}.jpg"
-                                cv2.imwrite(str(crop_path), crop)
-                                
-                                score = cv_engine.compare(target_path, str(crop_path))
-                                best_score = max(best_score, score)
-                                
-                                crop_path.unlink(missing_ok=True)
-                
-                temp_path.unlink(missing_ok=True)
-                return best_score if best_score > 0 else cv_engine.compare(target_path, str(temp_path))
-            else:
-                score = cv_engine.compare(target_path, str(temp_path))
-                temp_path.unlink(missing_ok=True)
-                return score
+            # Видаляємо тимчасовий файл
+            temp_path.unlink(missing_ok=True)
+            return score
                 
         except Exception as e:
             log.debug(f"Помилка аналізу зображення: {e}")
             temp_path.unlink(missing_ok=True)
             return 0.0
     
-    async def _send_pending_matches(self, context):
+    async def _send_pending_matches(self, app):
         """Відправка знайдених збігів в канал"""
         matches = await DB.get_unsent_matches()
         
@@ -735,37 +706,32 @@ class Monitor:
                 # Перевіряємо на репліки
                 title_lower = match['ad_title'].lower()
                 is_replica = any(k in title_lower for k in 
-                    ['реплік', 'копі', 'replica', 'clone', 'aaa', '1:1', 'підроб', 'fake'])
-                
-                # Форматуємо ціну
-                price = match['ad_price']
-                if len(price) > 20:
-                    price = price[:20] + "..."
+                    ['реплік', 'копі', 'replica', 'clone', 'aaa', '1:1', 'підроб'])
                 
                 # Формуємо повідомлення
                 caption = (
                     f"🔥 <b>ЗНАЙДЕНО ТОВАР!</b>\n\n"
                     f"🎯 <b>Ціль:</b> {match['target_name']}\n"
                     f"📦 <b>Назва:</b> {match['ad_title'][:150]}\n"
-                    f"💰 <b>Ціна:</b> {price}\n"
+                    f"💰 <b>Ціна:</b> {match['ad_price']}\n"
                     f"📊 <b>Схожість:</b> {match['similarity']:.1%}\n"
                 )
                 
                 if is_replica:
-                    caption += f"⚠️ <b>УВАГА! Можлива репліка/копія</b>\n"
+                    caption += f"⚠️ <b>Можлива репліка!</b>\n"
                 
                 caption += f"\n🔗 <a href='{match['ad_url']}'>🔍 ПЕРЕЙТИ ДО ОГОЛОШЕННЯ</a>"
                 
                 # Відправляємо
                 if match['image_url']:
-                    await context.bot.send_photo(
+                    await app.bot.send_photo(
                         chat_id=CONFIG.CHANNEL_ID,
                         photo=match['image_url'],
                         caption=caption,
                         parse_mode=ParseMode.HTML
                     )
                 else:
-                    await context.bot.send_message(
+                    await app.bot.send_message(
                         chat_id=CONFIG.CHANNEL_ID,
                         text=caption,
                         parse_mode=ParseMode.HTML,
@@ -779,6 +745,7 @@ class Monitor:
             except Exception as e:
                 log.error(f"Помилка відправки в канал: {e}")
 
+# Глобальний екземпляр монітора
 monitor = Monitor()
 
 # ============================================================================
@@ -797,17 +764,28 @@ class OLXBot:
     def _handlers(self):
         self.app.add_handler(CommandHandler("start", self.cmd_start))
         self.app.add_handler(CommandHandler("stats", self.cmd_stats))
+        self.app.add_handler(CommandHandler("scan", self.cmd_scan_now))  # Команда для примусового сканування
         self.app.add_handler(CallbackQueryHandler(self.callback_handler))
         self.app.add_handler(MessageHandler(filters.PHOTO, self.handle_photo))
-        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text))
         self.app.add_error_handler(self.error_handler)
     
     async def post_init(self, app):
+        """Ініціалізація після запуску"""
+        # Запускаємо веб-сервер
         await self._web_server()
-        asyncio.create_task(self._auto_start())
+        
+        # Запускаємо моніторинг
+        asyncio.create_task(self._start_monitor_delayed(app))
+        
         log.info("✅ Бот ініціалізовано")
     
+    async def _start_monitor_delayed(self, app):
+        """Запуск моніторингу з затримкою"""
+        await asyncio.sleep(5)
+        await monitor.start(app)
+    
     async def _web_server(self):
+        """Запуск веб-сервера для статусу"""
         app = web.Application()
         app.router.add_get('/', self.web_index)
         app.router.add_get('/api/stats', self.web_stats)
@@ -818,11 +796,8 @@ class OLXBot:
         await site.start()
         log.info(f"🌐 Веб-дашборд: http://0.0.0.0:{CONFIG.PORT}")
     
-    async def _auto_start(self):
-        await asyncio.sleep(5)
-        await monitor.start(ContextTypes.DEFAULT_TYPE(application=self.app))
-    
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /start"""
         if not update or not update.effective_user:
             return
         
@@ -831,11 +806,8 @@ class OLXBot:
             return
         
         targets = await DB.get_targets()
-        matches = await DB.fetch_all('SELECT COUNT(*) as cnt FROM matches')
-        match_count = matches[0]['cnt'] if matches else 0
-        unsent = await DB.fetch_all('SELECT COUNT(*) as cnt FROM matches WHERE sent_to_channel = 0')
-        unsent_count = unsent[0]['cnt'] if unsent else 0
         
+        # Формуємо клавіатуру
         keyboard = [
             [InlineKeyboardButton("🎯 ЦІЛІ", callback_data="targets_list"),
              InlineKeyboardButton("➕ ДОДАТИ", callback_data="add_target")],
@@ -843,27 +815,25 @@ class OLXBot:
              InlineKeyboardButton("⏹ СТОП", callback_data="monitor_stop")],
             [InlineKeyboardButton("📊 СТАТИСТИКА", callback_data="stats"),
              InlineKeyboardButton("🧹 ОЧИСТИТИ", callback_data="clean_cache")],
+            [InlineKeyboardButton("⚡ СКАНУВАТИ ЗАРАЗ", callback_data="scan_now")],
         ]
         
         await update.message.reply_text(
-            f"🏭 <b>OLX Monitor Pro v1.0</b>\n"
+            f"🏭 <b>OLX Monitor Pro v2.0</b>\n"
             f"AI моніторинг OLX.ua\n\n"
             f"📊 <b>Статус:</b>\n"
             f"• Цілей в базі: {len(targets)}\n"
-            f"• Знайдено матчів: {match_count}\n"
-            f"• Очікує відправки: {unsent_count}\n"
-            f"• Поріг схожості: {int(CONFIG.SIMILARITY_THRESHOLD*100)}%\n"
             f"• Моніторинг: {'🟢 АКТИВНИЙ' if monitor.is_running else '🔴 ЗУПИНЕНО'}\n"
             f"• Перевірено оголошень: {monitor.stats['ads_checked']}\n"
-            f"• Знайдено збігів: {monitor.stats['matches']}",
+            f"• Знайдено збігів: {monitor.stats['matches']}\n"
+            f"• Інтервал: {CONFIG.SCAN_INTERVAL} сек\n"
+            f"• Поріг схожості: {int(CONFIG.SIMILARITY_THRESHOLD*100)}%",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=ParseMode.HTML
         )
     
     async def cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not update or not update.effective_user:
-            return
-        
+        """Команда /stats"""
         if update.effective_user.id != CONFIG.ADMIN_ID:
             await update.message.reply_text("⛔ Доступ заборонено")
             return
@@ -875,22 +845,61 @@ class OLXBot:
         await update.message.reply_text(
             f"📈 <b>Детальна статистика</b>\n\n"
             f"<b>Система:</b>\n"
-            f"• CPU: {os.cpu_count()} cores\n"
+            f"• Моніторинг: {'АКТИВНИЙ' if monitor.is_running else 'ЗУПИНЕНО'}\n"
             f"• YOLO: {'✅' if yolo.model else '❌'}\n"
-            f"• Кеш CV: {len(cv_engine.cache)}\n\n"
+            f"• CV кеш: {len(cv_engine.cache)}\n\n"
             f"<b>База даних:</b>\n"
             f"• Активних цілей: {len(targets)}\n"
             f"• Всього матчів: {matches[0]['cnt'] if matches else 0}\n"
             f"• Переглянуто оголошень: {seen[0]['cnt'] if seen else 0}\n\n"
-            f"<b>Моніторинг:</b>\n"
-            f"• Всього сканувань: {monitor.stats['processed']}\n"
-            f"• Знайдено збігів: {monitor.stats['matches']}\n"
+            f"<b>За поточну сесію:</b>\n"
+            f"• Сканувань: {monitor.stats['processed']}\n"
+            f"• Збігів: {monitor.stats['matches']}\n"
             f"• Перевірено фото: {monitor.stats['ads_checked']}\n"
             f"• Помилок: {monitor.stats['errors']}",
             parse_mode=ParseMode.HTML
         )
     
+    async def cmd_scan_now(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Примусове сканування зараз"""
+        if update.effective_user.id != CONFIG.ADMIN_ID:
+            return
+        
+        await update.message.reply_text("⏳ Запускаю примусове сканування...")
+        
+        # Запускаємо сканування в окремому завданні
+        asyncio.create_task(self._force_scan(update, context))
+    
+    async def _force_scan(self, update: Update, context):
+        """Примусове сканування"""
+        try:
+            targets = await DB.get_targets()
+            if not targets:
+                await context.bot.send_message(
+                    chat_id=update.effective_user.id,
+                    text="❌ Немає цілей для сканування"
+                )
+                return
+            
+            count = 0
+            for target in targets[:5]:  # Максимум 5 за раз
+                ads = await olx.search(target['name'], pages=2)
+                if ads:
+                    count += len(ads)
+                await asyncio.sleep(2)
+            
+            await context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text=f"✅ Примусове сканування завершено!\nПеревірено {count} оголошень"
+            )
+        except Exception as e:
+            await context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text=f"❌ Помилка: {str(e)[:100]}"
+            )
+    
     async def callback_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обробка натискань кнопок"""
         if not update or not update.callback_query:
             return
         
@@ -916,15 +925,29 @@ class OLXBot:
             
             elif data == "add_target":
                 context.user_data["state"] = "wait_img"
-                await query.edit_message_text("📸 Надішліть фото товару для додавання в базу")
+                await query.edit_message_text(
+                    "📸 Надішліть фото товару.\n"
+                    "Назва буде взята з файлу або створена автоматично."
+                )
             
             elif data == "monitor_start":
-                await monitor.start(context)
+                await monitor.start(context.application)
                 await query.edit_message_text("🚀 Моніторинг запущено")
             
             elif data == "monitor_stop":
                 await monitor.stop()
                 await query.edit_message_text("🛑 Моніторинг зупинено")
+            
+            elif data == "scan_now":
+                await query.edit_message_text("⏳ Запускаю сканування...")
+                # Запускаємо сканування
+                targets = await DB.get_targets()
+                count = 0
+                for target in targets[:5]:
+                    ads = await olx.search(target['name'], pages=2)
+                    count += len(ads)
+                    await asyncio.sleep(2)
+                await query.edit_message_text(f"✅ Сканування завершено!\nПеревірено {count} оголошень")
             
             elif data == "stats":
                 await self.cmd_stats(update, context)
@@ -948,6 +971,7 @@ class OLXBot:
                 pass
     
     async def _show_targets(self, query):
+        """Показати список цілей"""
         targets = await DB.get_targets()
         
         if not targets:
@@ -974,6 +998,7 @@ class OLXBot:
         )
     
     async def _target_delete_confirm(self, query):
+        """Підтвердження видалення"""
         tid = query.data.replace("target_del_", "")
         target = await DB.fetch_one('SELECT * FROM targets WHERE id = ?', (tid,))
         
@@ -997,6 +1022,7 @@ class OLXBot:
         )
     
     async def _target_delete(self, query):
+        """Видалення цілі"""
         tid = query.data.replace("target_del_yes_", "")
         await DB.delete_target(tid)
         await query.edit_message_text("✅ Ціль видалено")
@@ -1004,6 +1030,7 @@ class OLXBot:
         await self._show_targets(query)
     
     async def _targets_clear_confirm(self, query):
+        """Підтвердження видалення всіх"""
         targets = await DB.get_targets()
         
         keyboard = [
@@ -1021,66 +1048,59 @@ class OLXBot:
         )
     
     async def _targets_clear(self, query):
+        """Видалення всіх цілей"""
         await DB.delete_all_targets()
         await query.edit_message_text("✅ Всі цілі видалено")
     
     async def handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not update or not update.message:
-            return
-        
+        """Обробка фото - додавання цілі"""
         if context.user_data.get("state") != "wait_img":
             return
         
         try:
-            file = await update.message.photo[-1].get_file()
+            # Отримуємо фото
+            photo = update.message.photo[-1]
+            file = await photo.get_file()
+            
+            # Генеруємо назву з дати та часу
+            now = datetime.now()
+            default_name = f"Товар {now.strftime('%d.%m %H:%M')}"
+            
+            # Зберігаємо фото
             filename = f"target_{secrets.token_hex(8)}.jpg"
             path = CONFIG.TARGETS_DIR / filename
             await file.download_to_drive(path)
             
-            context.user_data["tmp_p"] = str(path)
-            context.user_data["state"] = "wait_name"
-            
-            await update.message.reply_text(
-                "✅ Фото збережено!\n"
-                "📝 Введіть назву товару:"
-            )
-            
-        except Exception as e:
-            log.error(f"Помилка збереження фото: {e}")
-            await update.message.reply_text("❌ Помилка збереження фото")
-    
-    async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not update or not update.message:
-            return
-        
-        if context.user_data.get("state") == "wait_name":
-            name = update.message.text.strip()
-            tmp_path = context.user_data.get("tmp_p")
-            
-            if not tmp_path or not os.path.exists(tmp_path):
-                await update.message.reply_text("❌ Фото не знайдено")
-                context.user_data.clear()
-                return
-            
+            # Додаємо ціль з автоматичною назвою
             target = {
                 'id': f"TGT_{secrets.token_hex(4)}",
-                'name': name[:100],
-                'path': tmp_path,
+                'name': default_name,
+                'path': str(path),
                 'created': int(time.time()),
                 'priority': 1
             }
             
             if await DB.add_target(target):
-                await update.message.reply_text(f"✅ Ціль '{name}' додана!")
+                await update.message.reply_text(
+                    f"✅ Ціль додана!\n"
+                    f"📝 Назва: {default_name}\n"
+                    f"🆔 ID: {target['id']}\n\n"
+                    f"Можете змінити назву командою /rename {target['id']} нова_назва"
+                )
             else:
                 await update.message.reply_text("❌ Помилка додавання цілі")
             
             context.user_data.clear()
+            
+        except Exception as e:
+            log.error(f"Помилка обробки фото: {e}")
+            await update.message.reply_text(f"❌ Помилка: {str(e)[:100]}")
+            context.user_data.clear()
     
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Безпечний обробник помилок"""
+        """Обробник помилок"""
         error_msg = f"❌ Помилка: {str(context.error)[:150]}"
-        log.error(f"Update {update.update_id if update else 'N/A'} caused error: {context.error}")
+        log.error(f"Помилка: {context.error}")
         
         try:
             if update and update.callback_query:
@@ -1091,6 +1111,7 @@ class OLXBot:
             pass
     
     async def web_index(self, request):
+        """Головна сторінка веб-дашборду"""
         targets = await DB.get_targets()
         matches = await DB.fetch_all('SELECT COUNT(*) as cnt FROM matches')
         
@@ -1100,6 +1121,7 @@ class OLXBot:
         <head>
             <title>OLX Monitor Pro</title>
             <meta charset="UTF-8">
+            <meta http-equiv="refresh" content="30">
             <style>
                 body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #0a0a0c; color: #e4e4e7; margin: 0; padding: 30px; }}
                 .container {{ max-width: 1200px; margin: 0 auto; }}
@@ -1108,12 +1130,23 @@ class OLXBot:
                 .card {{ background: #16161a; border-radius: 12px; padding: 25px; border: 1px solid #2a2a2e; }}
                 .value {{ font-size: 2.5em; font-weight: bold; color: #4caf50; margin: 10px 0; }}
                 .label {{ color: #888; text-transform: uppercase; font-size: 0.9em; }}
+                .status {{ padding: 5px 10px; border-radius: 5px; display: inline-block; }}
+                .active {{ background: #1e3a2e; color: #4caf50; }}
+                .inactive {{ background: #3a1e1e; color: #f44336; }}
             </style>
         </head>
         <body>
             <div class="container">
-                <h1>🏭 OLX Monitor Pro v1.0</h1>
+                <h1>🏭 OLX Monitor Pro v2.0</h1>
                 <div class="stats">
+                    <div class="card">
+                        <div class="label">Статус моніторингу</div>
+                        <div class="value">
+                            <span class="status {'active' if monitor.is_running else 'inactive'}">
+                                {'АКТИВНИЙ' if monitor.is_running else 'ЗУПИНЕНО'}
+                            </span>
+                        </div>
+                    </div>
                     <div class="card">
                         <div class="label">Активні цілі</div>
                         <div class="value">{len(targets)}</div>
@@ -1134,25 +1167,30 @@ class OLXBot:
         return web.Response(text=html, content_type='text/html')
     
     async def web_stats(self, request):
+        """API для статистики"""
         targets = await DB.get_targets()
         matches = await DB.fetch_all('SELECT COUNT(*) as cnt FROM matches')
         
         return web.json_response({
+            'status': 'active' if monitor.is_running else 'stopped',
             'targets': len(targets),
             'matches': matches[0]['cnt'] if matches else 0,
-            'monitor': monitor.is_running,
             'processed': monitor.stats['processed'],
             'matches_found': monitor.stats['matches'],
             'ads_checked': monitor.stats['ads_checked'],
-            'cache_size': len(cv_engine.cache)
+            'errors': monitor.stats['errors'],
+            'cache_size': len(cv_engine.cache),
+            'interval': CONFIG.SCAN_INTERVAL,
+            'threshold': CONFIG.SIMILARITY_THRESHOLD
         })
     
     def run(self):
+        """Запуск бота"""
         print("""
         ╔════════════════════════════════════════════════════════════╗
-        ║     OLX Monitor Pro v1.0                                  ║
+        ║     OLX Monitor Pro v2.0                                  ║
         ║     AI моніторинг OLX.ua                                  ║
-        ║     High-Speed · YOLOv8 · CV Engine · Channel Posts       ║
+        ║     Автоматичне сканування · Пости в канал                ║
         ╚════════════════════════════════════════════════════════════╝
         """)
         
