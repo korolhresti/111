@@ -71,7 +71,7 @@ class Config:
         # Налаштування пошуку
         self.SCAN_INTERVAL = 600
         self.MAX_TARGETS_PER_SCAN = 3
-        self.MAX_ADS_PER_TARGET = 20
+        self.MAX_ADS_PER_TARGET = 2000
         self.SEARCH_PAGES = 2
         
         # Шляхи
