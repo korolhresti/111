@@ -435,13 +435,13 @@ class OLXParser:
         self.last_request_time = 0
         self.request_count = 0
         
-        # ПРАВИЛЬНИЙ список браузерів - використовуємо об'єкти BrowserType
+        # Список браузерів для імітації (використовуємо рядки для надійності)
         self.browsers = [
-            BrowserType.chrome120,
-            BrowserType.chrome119,
-            BrowserType.firefox110,
-            BrowserType.edge101,
-            BrowserType.safari17_0
+            "chrome120",
+            "chrome119",
+            "firefox110",
+            "edge101",
+            "safari17_0"
         ]
     
     async def _get_delay(self):
