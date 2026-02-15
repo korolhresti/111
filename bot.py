@@ -54,7 +54,7 @@ class Config:
         self.TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
         self.ADMIN_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
         self.CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
-        self.PORT = int(os.getenv("PORT", 8080"))
+        self.PORT = int(os.getenv("PORT", "8080"))
         
         # ===== НАЛАШТУВАННЯ ПОШУКУ =====
         self.SIMILARITY_THRESHOLD = 0.80
