@@ -1,4 +1,5 @@
 
+
 import os
 import json
 import time
@@ -37,13 +38,16 @@ from ultralytics import YOLO
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     ApplicationBuilder, ContextTypes, CommandHandler,
-    CallbackQueryHandler, MessageHandler, filters
+    CallbackQueryHandler, MessageHandler, filters, ConversationHandler
 )
 from telegram.constants import ParseMode
 
 # ============================================================================
 # [1] КОНФІГУРАЦІЯ
 # ============================================================================
+
+# Стани для ConversationHandler
+WAITING_FOR_PHOTO, WAITING_FOR_NAME = range(2)
 
 class Config:
     def __init__(self):
@@ -55,21 +59,21 @@ class Config:
         
         # ===== НАЛАШТУВАННЯ ПОШУКУ =====
         self.SIMILARITY_THRESHOLD = 0.80  # 80% поріг збігу
-        self.WATCH_KEYWORDS = ['годинник', 'watch', 'часы', 'hodynnyk', 'wristwatch']
+        self.DEFAULT_SEARCH_QUERY = "годинник б у"  # Стандартний пошуковий запит
         
         # ===== АНТИ-БЛОК НАЛАШТУВАННЯ =====
         self.USE_PROXY = os.getenv("USE_PROXY", "false").lower() == "true"
-        self.PROXY_URL = os.getenv("PROXY_URL", "")  # Наприклад: http://user:pass@ip:port
+        self.PROXY_URL = os.getenv("PROXY_URL", "")
         self.REQUEST_TIMEOUT = 30
-        self.MIN_DELAY = 5  # Мінімальна затримка між запитами (сек)
-        self.MAX_DELAY = 15  # Максимальна затримка
-        self.MAX_RETRIES = 3  # Кількість спроб при помилці
+        self.MIN_DELAY = 10
+        self.MAX_DELAY = 25
+        self.MAX_RETRIES = 3
         
         # Налаштування пошуку
-        self.SCAN_INTERVAL = 600  # Скануємо кожні 10 хвилин (рідше, щоб не блокували)
-        self.MAX_TARGETS_PER_SCAN = 5  # Менше цілей за раз
-        self.MAX_ADS_PER_TARGET = 20
-        self.SEARCH_PAGES = 2  # Менше сторінок
+        self.SCAN_INTERVAL = 900  # 15 хвилин
+        self.MAX_TARGETS_PER_SCAN = 3
+        self.MAX_ADS_PER_TARGET = 30
+        self.SEARCH_PAGES = 2
         
         # Шляхи
         self.BASE_DIR = Path(__file__).parent.resolve()
@@ -81,7 +85,7 @@ class Config:
         for d in [self.DATA_DIR, self.CACHE_DIR, self.LOGS_DIR, self.TARGETS_DIR]:
             d.mkdir(parents=True, exist_ok=True)
         
-        self.DB_PATH = self.DATA_DIR / "watch_monitor.db"
+        self.DB_PATH = self.DATA_DIR / "watch_finder.db"
         
         # YOLO
         self.YOLO_MODEL = "yolov8n.pt"
@@ -108,10 +112,9 @@ logging.basicConfig(
     format='%(asctime)s | %(levelname)s | %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
-log = logging.getLogger("WatchMonitor")
+log = logging.getLogger("WatchFinder")
 
-# Додаємо файловий логер
-log_file = CONFIG.LOGS_DIR / "watch_monitor.log"
+log_file = CONFIG.LOGS_DIR / "watch_finder.log"
 file_handler = logging.handlers.RotatingFileHandler(
     log_file, maxBytes=10*1024*1024, backupCount=5
 )
@@ -137,6 +140,7 @@ class Database:
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 path TEXT NOT NULL,
+                search_query TEXT NOT NULL,
                 created INTEGER,
                 priority INTEGER DEFAULT 1,
                 search_count INTEGER DEFAULT 0,
@@ -202,17 +206,18 @@ class Database:
         try:
             query = '''
                 INSERT OR REPLACE INTO targets 
-                (id, name, path, created, priority)
-                VALUES (?, ?, ?, ?, ?)
+                (id, name, path, search_query, created, priority)
+                VALUES (?, ?, ?, ?, ?, ?)
             '''
             await self.execute(query, (
                 target['id'],
                 target['name'],
                 target['path'],
+                target.get('search_query', CONFIG.DEFAULT_SEARCH_QUERY),
                 target.get('created', int(time.time())),
                 target.get('priority', 1)
             ))
-            log.info(f"✅ Ціль-годинник додано: {target['name']}")
+            log.info(f"✅ Ціль додано: {target['name']} (пошук: {target.get('search_query', CONFIG.DEFAULT_SEARCH_QUERY)})")
             return True
         except Exception as e:
             log.error(f"❌ Помилка додавання цілі: {e}")
@@ -279,7 +284,7 @@ class Database:
             
             await self.update_target_stats(target['id'], found_match=True)
             await self.mark_ad_seen(ad['url'], target['id'])
-            log.info(f"🔥 ЗБІГ 80%+! {target['name']} - {similarity:.1%}")
+            log.info(f"🔥 ЗБІГ! {target['name']} - {similarity:.1%}")
             return True
         except Exception as e:
             log.error(f"❌ Помилка додавання збігу: {e}")
@@ -296,7 +301,7 @@ class Database:
 DB = Database()
 
 # ============================================================================
-# [4] YOLO ДЕТЕКТОР
+# [4] YOLO ДЕТЕКТОР (з оптимізацією пам'яті)
 # ============================================================================
 
 class YOLODetector:
@@ -328,7 +333,14 @@ class YOLODetector:
                     cls = int(box.cls[0])
                     label = self.model.names.get(cls, "").lower()
                     if any(watch_class in label for watch_class in watch_classes):
+                        # Очищаємо пам'ять
+                        del results
+                        gc.collect()
                         return True
+            
+            # Очищаємо пам'ять
+            del results
+            gc.collect()
             return False
         except Exception as e:
             log.error(f"YOLO помилка: {e}")
@@ -337,7 +349,7 @@ class YOLODetector:
 yolo = YOLODetector()
 
 # ============================================================================
-# [5] CV ENGINE
+# [5] CV ENGINE (з оптимізацією пам'яті)
 # ============================================================================
 
 class CVEngine:
@@ -399,8 +411,12 @@ class CVEngine:
             final = min(1.0, max(0.0, final))
             
             self.cache[cache_key] = final
-            if len(self.cache) > 1000:
+            if len(self.cache) > 500:  # Обмежуємо кеш
                 self.cache.clear()
+            
+            # Очищаємо великі об'єкти
+            del img1, img2, gray1, gray2, kp1, kp2, des1, des2
+            gc.collect()
             
             return final
         except Exception as e:
@@ -409,56 +425,51 @@ class CVEngine:
     
     def clear_cache(self):
         self.cache.clear()
+        gc.collect()
         log.info("🧹 CV кеш очищено")
 
 cv_engine = CVEngine()
 
 # ============================================================================
-# [6] OLX ПАРСЕР - З ВИКОРИСТАННЯМ CURL_CFFI (АНТИ-БЛОК)
+# [6] OLX ПАРСЕР
 # ============================================================================
 
-class OLXWatchParser:
+class OLXParser:
     def __init__(self):
         self.ua = UserAgent()
-        self.session = None
         self.last_request_time = 0
         self.request_count = 0
         
-        #  Список браузерів для імітації (використовуємо рядки для надійності)
         self.browsers = [
-            "chrome120",
-            "chrome119",
-            "firefox110",
-            "edge101",
-            "safari17_0"
+            BrowserType.chrome120,
+            BrowserType.chrome119,
+            BrowserType.firefox110,
+            BrowserType.edge101,
+            BrowserType.safari17_0
         ]
     
     async def _get_delay(self):
-        """Отримання випадкової затримки"""
         now = time.time()
         if self.last_request_time > 0:
             elapsed = now - self.last_request_time
             if elapsed < CONFIG.MIN_DELAY:
                 delay = random.uniform(CONFIG.MIN_DELAY, CONFIG.MAX_DELAY)
+                log.info(f"⏳ Пауза {delay:.0f} секунд...")
                 await asyncio.sleep(delay)
         
         self.last_request_time = time.time()
         self.request_count += 1
         
-        # Кожні 10 запитів робимо довгу паузу
         if self.request_count % 10 == 0:
             log.info("🔄 Довга пауза після 10 запитів...")
             await asyncio.sleep(30)
     
     async def fetch_page(self, url: str, retry: int = 0) -> Optional[str]:
-        """Завантаження сторінки з імітацією браузера"""
         await self._get_delay()
         
         try:
-            # Вибираємо випадковий браузер
             browser = random.choice(self.browsers)
             
-            # Підготовка заголовків
             headers = {
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                 'Accept-Language': 'uk-UA,uk;q=0.9,en;q=0.8,ru;q=0.7',
@@ -466,17 +477,10 @@ class OLXWatchParser:
                 'DNT': '1',
                 'Connection': 'keep-alive',
                 'Upgrade-Insecure-Requests': '1',
-                'Sec-Fetch-Dest': 'document',
-                'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'none',
-                'Sec-Fetch-User': '?1',
-                'Cache-Control': 'max-age=0',
             }
             
-            # Налаштування проксі
             proxy = CONFIG.PROXY_URL if CONFIG.USE_PROXY else None
             
-            # Виконуємо запит через curl_cffi
             response = curl_requests.get(
                 url,
                 headers=headers,
@@ -487,18 +491,18 @@ class OLXWatchParser:
             )
             
             if response.status_code == 200:
-                log.info(f"✅ Успішний запит до {url[:50]}... (статус: 200)")
+                log.info(f"✅ Запит успішний")
                 return response.text
             elif response.status_code == 403:
-                log.warning(f"❌ Блок 403! OLX заблокував запит. Спроба {retry + 1}/{CONFIG.MAX_RETRIES}")
+                log.warning(f"❌ Блок 403! Спроба {retry + 1}/{CONFIG.MAX_RETRIES}")
                 if retry < CONFIG.MAX_RETRIES - 1:
-                    wait_time = random.uniform(60, 120)  # Чекаємо 1-2 хвилини
-                    log.info(f"⏳ Очікування {wait_time:.0f} секунд перед повторною спробою...")
+                    wait_time = random.uniform(60, 120)
+                    log.info(f"⏳ Очікування {wait_time:.0f} секунд...")
                     await asyncio.sleep(wait_time)
                     return await self.fetch_page(url, retry + 1)
                 return None
             else:
-                log.warning(f"⚠️ Неочікуваний статус: {response.status_code}")
+                log.warning(f"⚠️ Статус: {response.status_code}")
                 return None
                 
         except Exception as e:
@@ -510,46 +514,28 @@ class OLXWatchParser:
                 return await self.fetch_page(url, retry + 1)
             return None
     
-    def is_watch_ad(self, title: str) -> bool:
-        """Перевіряє чи це оголошення про годинник"""
-        title_lower = title.lower()
-        
-        # Має містити ключові слова про годинники
-        if not any(keyword in title_lower for keyword in CONFIG.WATCH_KEYWORDS):
-            return False
-        
-        # Виключаємо явно не годинники
-        exclude = ['настінний', 'wall', 'настольний', 'desk', 'пісочний', 'sand', 'remont']
-        if any(word in title_lower for word in exclude):
-            return False
-        
-        return True
-    
     async def search_watches(self, query: str, pages: int = 2) -> List[Dict]:
-        """Спеціалізований пошук годинників з анти-блок захистом"""
+        """Пошук годинників за запитом"""
         all_ads = []
         seen_urls = set()
         
-        # Формуємо базовий URL
+        # Формуємо URL
         query_encoded = query.replace(' ', '-')
         base_url = f"https://www.olx.ua/uk/list/q-{query_encoded}/"
+        
+        log.info(f"🔍 Пошук: {query}")
         
         for page in range(1, pages + 1):
             url = base_url
             if page > 1:
                 url += f"?page={page}"
             
-            log.info(f"📄 Завантаження сторінки {page}...")
-            
             html = await self.fetch_page(url)
             if not html:
-                log.warning(f"❌ Не вдалося завантажити сторінку {page}")
                 continue
             
             try:
                 soup = BeautifulSoup(html, 'lxml')
-                
-                # Шукаємо картки оголошень
                 cards = soup.select('div[data-cy="l-card"]')
                 
                 if not cards:
@@ -563,11 +549,9 @@ class OLXWatchParser:
                 
                 for card in cards:
                     try:
-                        # Пропускаємо TOP
                         if card.select_one('[data-testid="adCard-featured"]'):
                             continue
                         
-                        # Заголовок
                         title_elem = card.select_one('h6')
                         if not title_elem:
                             title_elem = card.select_one('a.css-1bbgabe')
@@ -576,14 +560,7 @@ class OLXWatchParser:
                             continue
                         
                         title = title_elem.get_text(strip=True)
-                        if not title or len(title) < 3:
-                            continue
                         
-                        # Перевіряємо чи це годинник
-                        if not self.is_watch_ad(title):
-                            continue
-                        
-                        # Посилання
                         link_elem = card.select_one('a[href]')
                         if not link_elem:
                             continue
@@ -595,14 +572,12 @@ class OLXWatchParser:
                             continue
                         seen_urls.add(ad_url)
                         
-                        # Ціна
                         price_elem = card.select_one('[data-testid="ad-price"]')
                         if not price_elem:
                             price_elem = card.select_one('.css-10b0b6q')
                         
                         price = price_elem.get_text(strip=True) if price_elem else "—"
                         
-                        # Зображення
                         img_elem = card.select_one('img')
                         images = []
                         if img_elem:
@@ -623,20 +598,19 @@ class OLXWatchParser:
                     except Exception as e:
                         continue
                 
-                # Додаткова випадкова затримка між сторінками
                 if page < pages:
-                    delay = random.uniform(10, 20)
-                    log.info(f"⏳ Пауза {delay:.0f} секунд перед наступною сторінкою...")
+                    delay = random.uniform(15, 25)
+                    log.info(f"⏳ Пауза {delay:.0f} секунд...")
                     await asyncio.sleep(delay)
                 
             except Exception as e:
-                log.error(f"Помилка парсингу сторінки {page}: {e}")
+                log.error(f"Помилка парсингу: {e}")
                 continue
         
-        log.info(f"✅ Знайдено {len(all_ads)} годинників для '{query}'")
+        log.info(f"✅ Знайдено {len(all_ads)} оголошень для '{query}'")
         return all_ads[:CONFIG.MAX_ADS_PER_TARGET]
 
-olx = OLXWatchParser()
+olx = OLXParser()
 
 # ============================================================================
 # [7] МОНІТОРИНГ
@@ -656,12 +630,11 @@ class WatchMonitor:
     
     async def start(self, app):
         if self.is_running:
-            log.info("Моніторинг вже працює")
             return
         
         self.is_running = True
         self.task = asyncio.create_task(self._run(app))
-        log.info("🚀 Моніторинг годинників запущено (поріг 80%, анти-блок)")
+        log.info("🚀 Моніторинг запущено")
         return self.task
     
     async def stop(self):
@@ -675,28 +648,27 @@ class WatchMonitor:
         log.info("🛑 Моніторинг зупинено")
     
     async def _run(self, app):
-        log.info("🔄 Запуск головного циклу моніторингу")
+        log.info("🔄 Головний цикл моніторингу")
         
         while self.is_running:
             try:
                 targets = await DB.get_targets()
                 
                 if not targets:
-                    log.debug("Немає цілей для моніторингу")
                     await asyncio.sleep(60)
                     continue
                 
-                log.info(f"🎯 Починаємо сканування {len(targets)} цілей-годинників")
+                log.info(f"🎯 Сканування {len(targets)} цілей")
                 
-                # Беремо тільки перші N цілей
-                targets_to_scan = targets[:CONFIG.MAX_TARGETS_PER_SCAN]
-                
-                for target in targets_to_scan:
+                for target in targets[:CONFIG.MAX_TARGETS_PER_SCAN]:
                     try:
                         await self._process_target(target, app)
                         self.stats['processed'] += 1
-                        # Велика пауза між цілями
-                        await asyncio.sleep(random.uniform(30, 60))
+                        await asyncio.sleep(random.uniform(30, 45))
+                        
+                        # Очищаємо пам'ять після кожної цілі
+                        gc.collect()
+                        
                     except Exception as e:
                         self.stats['errors'] += 1
                         log.error(f"Помилка цілі {target['name']}: {e}")
@@ -709,30 +681,32 @@ class WatchMonitor:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                log.error(f"Помилка в головному циклі: {e}")
+                log.error(f"Помилка циклу: {e}")
                 await asyncio.sleep(60)
     
     async def _process_target(self, target: Dict, app):
         if not os.path.exists(target['path']):
-            log.warning(f"Фото цілі не знайдено: {target['path']}")
+            log.warning(f"Фото не знайдено: {target['path']}")
             return
         
-        log.info(f"🔍 Скануємо годинник: {target['name']}")
+        # Використовуємо збережений пошуковий запит
+        search_query = target.get('search_query', CONFIG.DEFAULT_SEARCH_QUERY)
+        log.info(f"🔍 Скануємо: {target['name']} (запит: {search_query})")
         
-        ads = await olx.search_watches(target['name'], pages=CONFIG.SEARCH_PAGES)
+        ads = await olx.search_watches(search_query, pages=CONFIG.SEARCH_PAGES)
         
         if not ads:
-            log.debug(f"Немає оголошень для {target['name']}")
+            log.debug(f"Немає оголошень")
             await DB.update_target_stats(target['id'])
             return
         
-        # Фільтруємо нові оголошення
+        # Фільтруємо нові
         new_ads = []
         for ad in ads:
             if not await DB.is_ad_seen(ad['url']):
                 new_ads.append(ad)
         
-        log.info(f"📊 {target['name']}: {len(ads)} всього, {len(new_ads)} нових")
+        log.info(f"📊 {len(ads)} всього, {len(new_ads)} нових")
         
         for ad in new_ads:
             if not ad.get('images'):
@@ -747,12 +721,15 @@ class WatchMonitor:
                     best_score = score
                     best_image = img_url
             
-            if best_score >= 0.80:
+            if best_score >= CONFIG.SIMILARITY_THRESHOLD:
                 await DB.add_match(target, ad, best_score, best_image)
                 self.stats['matches'] += 1
                 self.stats['above_80'] += 1
             
             self.stats['ads_checked'] += 1
+            
+            # Очищаємо пам'ять після кожного оголошення
+            gc.collect()
         
         await DB.update_target_stats(target['id'])
     
@@ -773,19 +750,21 @@ class WatchMonitor:
                     async with aiofiles.open(temp_path, 'wb') as f:
                         await f.write(content)
             
-            # YOLO перевіряє чи це годинник
+            # YOLO перевірка
             is_watch = yolo.detect_watch(str(temp_path))
             
             if not is_watch:
                 temp_path.unlink(missing_ok=True)
                 return 0.0
             
+            # Порівняння
             score = cv_engine.compare(target_path, str(temp_path))
+            
             temp_path.unlink(missing_ok=True)
             return score
                 
         except Exception as e:
-            log.debug(f"Помилка аналізу зображення: {e}")
+            log.debug(f"Помилка аналізу: {e}")
             temp_path.unlink(missing_ok=True)
             return 0.0
     
@@ -799,23 +778,16 @@ class WatchMonitor:
         
         for match in matches:
             try:
-                title_lower = match['ad_title'].lower()
-                is_replica = any(k in title_lower for k in 
-                    ['реплік', 'копі', 'replica', 'clone', 'aaa', '1:1', 'підроб'])
-                
                 caption = (
                     f"🔥 <b>ЗНАЙДЕНО ГОДИННИК!</b>\n\n"
                     f"🎯 <b>Ціль:</b> {match['target_name']}\n"
-                    f"📦 <b>Модель:</b> {match['ad_title'][:150]}\n"
+                    f"📦 <b>Опис:</b> {match['ad_title'][:150]}\n"
                     f"💰 <b>Ціна:</b> {match['ad_price']}\n"
                     f"📊 <b>Схожість:</b> {match['similarity']:.1%}\n"
                 )
                 
                 if match['similarity'] >= 0.90:
                     caption += "🔥 ІДЕАЛЬНИЙ ЗБІГ!\n"
-                
-                if is_replica:
-                    caption += f"⚠️ <b>Можлива репліка!</b>\n"
                 
                 caption += f"\n🔗 <a href='{match['ad_url']}'>🔍 ПЕРЕЙТИ ДО ОГОЛОШЕННЯ</a>"
                 
@@ -835,11 +807,11 @@ class WatchMonitor:
                     )
                 
                 await DB.mark_match_sent(match['id'])
-                log.info(f"✅ Відправлено в канал: {match['target_name']}")
+                log.info(f"✅ Відправлено в канал")
                 await asyncio.sleep(1)
                 
             except Exception as e:
-                log.error(f"Помилка відправки в канал: {e}")
+                log.error(f"Помилка відправки: {e}")
 
 monitor = WatchMonitor()
 
@@ -857,11 +829,21 @@ class WatchBot:
         self._handlers()
     
     def _handlers(self):
+        # ConversationHandler для додавання цілей
+        conv_handler = ConversationHandler(
+            entry_points=[CallbackQueryHandler(self.start_add_target, pattern="^add_target$")],
+            states={
+                WAITING_FOR_PHOTO: [MessageHandler(filters.PHOTO, self.handle_photo)],
+                WAITING_FOR_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_name)],
+            },
+            fallbacks=[CommandHandler("cancel", self.cancel)],
+        )
+        
         self.app.add_handler(CommandHandler("start", self.cmd_start))
         self.app.add_handler(CommandHandler("stats", self.cmd_stats))
         self.app.add_handler(CommandHandler("scan", self.cmd_scan_now))
+        self.app.add_handler(conv_handler)
         self.app.add_handler(CallbackQueryHandler(self.callback_handler))
-        self.app.add_handler(MessageHandler(filters.PHOTO, self.handle_photo))
         self.app.add_error_handler(self.error_handler)
     
     async def post_init(self, app):
@@ -895,31 +877,124 @@ class WatchBot:
         targets = await DB.get_targets()
         
         keyboard = [
-            [InlineKeyboardButton("🎯 МОЇ ГОДИННИКИ", callback_data="targets_list"),
-             InlineKeyboardButton("➕ ДОДАТИ", callback_data="add_target")],
-            [InlineKeyboardButton("▶️ СТАРТ", callback_data="monitor_start"),
+            [InlineKeyboardButton("🎯 МОЇ ЦІЛІ", callback_data="targets_list")],
+            [InlineKeyboardButton("➕ ДОДАТИ ГОДИННИК", callback_data="add_target")],
+            [InlineKeyboardButton("▶️ СТАРТ МОНІТОРИНГУ", callback_data="monitor_start"),
              InlineKeyboardButton("⏹ СТОП", callback_data="monitor_stop")],
             [InlineKeyboardButton("📊 СТАТИСТИКА", callback_data="stats"),
-             InlineKeyboardButton("🧹 ОЧИСТИТИ", callback_data="clean_cache")],
-            [InlineKeyboardButton("⚡ СКАНУВАТИ ЗАРАЗ", callback_data="scan_now")],
+             InlineKeyboardButton("🧹 ОЧИСТИТИ КЕШ", callback_data="clean_cache")],
+            [InlineKeyboardButton("⚡ ШВИДКИЙ ПОШУК", callback_data="quick_search")],
         ]
         
         await update.message.reply_text(
-            f"⌚ <b>Watch Monitor Pro v4.0 (Анти-блок)</b>\n"
-            f"Пошук наручних годинників на OLX\n\n"
+            f"⌚ <b>Watch Finder Pro v5.0</b>\n"
+            f"Візуальний пошук годинників на OLX\n\n"
             f"📊 <b>Статус:</b>\n"
             f"• Цілей в базі: {len(targets)}\n"
             f"• Моніторинг: {'🟢 АКТИВНИЙ' if monitor.is_running else '🔴 ЗУПИНЕНО'}\n"
             f"• Поріг збігу: 80%\n"
-            f"• Інтервал: {CONFIG.SCAN_INTERVAL} сек\n"
-            f"• Анти-блок: Увімкнено (curl_cffi)",
+            f"• Інтервал: {CONFIG.SCAN_INTERVAL} сек",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=ParseMode.HTML
         )
     
+    async def start_add_target(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Початок додавання цілі"""
+        query = update.callback_query
+        await query.answer()
+        
+        await query.edit_message_text(
+            "📸 Надішліть фото годинника, який хочете знайти.\n\n"
+            "Бот буде шукати схожі моделі на OLX за запитом 'годинник б у'"
+        )
+        
+        return WAITING_FOR_PHOTO
+    
+    async def handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обробка фото"""
+        try:
+            photo = update.message.photo[-1]
+            file = await photo.get_file()
+            
+            # Зберігаємо фото
+            filename = f"watch_{secrets.token_hex(8)}.jpg"
+            path = CONFIG.TARGETS_DIR / filename
+            await file.download_to_drive(path)
+            
+            # Зберігаємо шлях в контексті
+            context.user_data['photo_path'] = str(path)
+            
+            # Клавіатура для вибору назви
+            keyboard = [
+                [InlineKeyboardButton("✅ ГОДИННИК Б/У", callback_data="name_default")],
+                [InlineKeyboardButton("✏️ ВВЕСТИ СВОЮ НАЗВУ", callback_data="name_custom")],
+                [InlineKeyboardButton("❌ СКАСУВАТИ", callback_data="cancel_add")],
+            ]
+            
+            await update.message.reply_text(
+                "✅ Фото збережено!\n\n"
+                "Оберіть пошуковий запит для OLX:\n"
+                "• 'ГОДИННИК Б/У' - загальний пошук\n"
+                "• 'ВВЕСТИ СВОЮ НАЗВУ' - наприклад 'Casio', 'Omega' тощо",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            
+            return WAITING_FOR_NAME
+            
+        except Exception as e:
+            log.error(f"Помилка: {e}")
+            await update.message.reply_text(f"❌ Помилка: {str(e)[:100]}")
+            return ConversationHandler.END
+    
+    async def handle_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обробка введеної назви"""
+        name = update.message.text.strip()
+        photo_path = context.user_data.get('photo_path')
+        
+        if not photo_path or not os.path.exists(photo_path):
+            await update.message.reply_text("❌ Фото не знайдено. Почніть заново.")
+            return ConversationHandler.END
+        
+        # Додаємо ціль з введеною назвою
+        target = {
+            'id': f"WATCH_{secrets.token_hex(4)}",
+            'name': f"Годинник {datetime.now().strftime('%d.%m %H:%M')}",
+            'path': photo_path,
+            'search_query': name,  # Зберігаємо пошуковий запит
+            'created': int(time.time()),
+            'priority': 1
+        }
+        
+        if await DB.add_target(target):
+            keyboard = [
+                [InlineKeyboardButton("🎯 МОЇ ЦІЛІ", callback_data="targets_list")],
+                [InlineKeyboardButton("➕ ДОДАТИ ЩЕ", callback_data="add_target")],
+                [InlineKeyboardButton("🏠 ГОЛОВНЕ МЕНЮ", callback_data="main_menu")],
+            ]
+            
+            await update.message.reply_text(
+                f"✅ <b>ГОДИННИК ДОДАНО!</b>\n\n"
+                f"📝 Назва: {target['name']}\n"
+                f"🔍 Пошуковий запит: {name}\n\n"
+                f"Бот буде шукати схожі моделі на OLX "
+                f"та відправляти знахідки в канал.",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            await update.message.reply_text("❌ Помилка додавання")
+        
+        context.user_data.clear()
+        return ConversationHandler.END
+    
+    async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Скасування операції"""
+        await update.message.reply_text("❌ Операцію скасовано")
+        context.user_data.clear()
+        return ConversationHandler.END
+    
     async def cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_user.id != CONFIG.ADMIN_ID:
-            await update.message.reply_text("⛔ Доступ заборонено")
             return
         
         targets = await DB.get_targets()
@@ -928,18 +1003,14 @@ class WatchBot:
         
         await update.message.reply_text(
             f"📈 <b>Статистика</b>\n\n"
-            f"<b>Система:</b>\n"
-            f"• Моніторинг: {'АКТИВНИЙ' if monitor.is_running else 'ЗУПИНЕНО'}\n"
-            f"• YOLO: {'✅' if yolo.model else '❌'}\n\n"
             f"<b>База даних:</b>\n"
-            f"• Цілей-годинників: {len(targets)}\n"
+            f"• Цілей: {len(targets)}\n"
             f"• Всього збігів: {matches[0]['cnt'] if matches else 0}\n"
             f"• Збігів 80%+: {above_80[0]['cnt'] if above_80 else 0}\n\n"
             f"<b>За поточну сесію:</b>\n"
             f"• Сканувань: {monitor.stats['processed']}\n"
-            f"• Збігів 80%+: {monitor.stats['above_80']}\n"
-            f"• Перевірено фото: {monitor.stats['ads_checked']}\n"
-            f"• Помилок: {monitor.stats['errors']}",
+            f"• Збігів: {monitor.stats['above_80']}\n"
+            f"• Перевірено фото: {monitor.stats['ads_checked']}",
             parse_mode=ParseMode.HTML
         )
     
@@ -947,44 +1018,44 @@ class WatchBot:
         if update.effective_user.id != CONFIG.ADMIN_ID:
             return
         
-        await update.message.reply_text("⏳ Запускаю пошук годинників (це може зайняти кілька хвилин)...")
-        asyncio.create_task(self._force_scan(update, context))
+        await update.message.reply_text("⏳ Запускаю швидкий пошук...")
+        asyncio.create_task(self._quick_scan(update, context))
     
-    async def _force_scan(self, update: Update, context):
+    async def _quick_scan(self, update: Update, context):
         try:
             targets = await DB.get_targets()
             if not targets:
                 await context.bot.send_message(
                     chat_id=update.effective_user.id,
-                    text="❌ Немає цілей для пошуку"
+                    text="❌ Немає цілей"
                 )
                 return
             
-            total_ads = 0
-            matches_found = 0
+            total = 0
+            found = 0
             
-            for target in targets[:3]:  # Тільки 3 цілі для ручного сканування
+            for target in targets[:2]:
                 await context.bot.send_message(
                     chat_id=update.effective_user.id,
-                    text=f"🔍 Сканую {target['name']}..."
+                    text=f"🔍 Шукаю {target['name']}..."
                 )
                 
-                ads = await olx.search_watches(target['name'], pages=1)
-                total_ads += len(ads)
+                ads = await olx.search_watches(target['search_query'], pages=1)
+                total += len(ads)
                 
                 for ad in ads[:5]:
                     if ad.get('images'):
                         score = await monitor._analyze_watch_image(target['path'], ad['images'][0])
                         if score >= 0.80:
-                            matches_found += 1
+                            found += 1
                 
-                await asyncio.sleep(30)  # Пауза між цілями
+                await asyncio.sleep(20)
             
             await context.bot.send_message(
                 chat_id=update.effective_user.id,
                 text=f"✅ Пошук завершено!\n"
-                     f"Перевірено оголошень: {total_ads}\n"
-                     f"Знайдено збігів 80%+: {matches_found}"
+                     f"Перевірено: {total} оголошень\n"
+                     f"Збігів 80%+: {found}"
             )
         except Exception as e:
             await context.bot.send_message(
@@ -1004,6 +1075,69 @@ class WatchBot:
             if data == "targets_list":
                 await self._show_targets(query)
             
+            elif data == "add_target":
+                await self.start_add_target(update, context)
+            
+            elif data == "name_default":
+                # Використовуємо стандартний запит
+                photo_path = context.user_data.get('photo_path')
+                if photo_path:
+                    target = {
+                        'id': f"WATCH_{secrets.token_hex(4)}",
+                        'name': f"Годинник {datetime.now().strftime('%d.%m %H:%M')}",
+                        'path': photo_path,
+                        'search_query': "годинник б у",
+                        'created': int(time.time()),
+                        'priority': 1
+                    }
+                    
+                    if await DB.add_target(target):
+                        keyboard = [
+                            [InlineKeyboardButton("🎯 МОЇ ЦІЛІ", callback_data="targets_list")],
+                            [InlineKeyboardButton("➕ ДОДАТИ ЩЕ", callback_data="add_target")],
+                            [InlineKeyboardButton("🏠 ГОЛОВНЕ МЕНЮ", callback_data="main_menu")],
+                        ]
+                        
+                        await query.edit_message_text(
+                            f"✅ <b>ГОДИННИК ДОДАНО!</b>\n\n"
+                            f"🔍 Пошуковий запит: годинник б/у\n\n"
+                            f"Бот почне пошук автоматично.",
+                            reply_markup=InlineKeyboardMarkup(keyboard),
+                            parse_mode=ParseMode.HTML
+                        )
+                    context.user_data.clear()
+            
+            elif data == "name_custom":
+                await query.edit_message_text(
+                    "✏️ Напишіть назву для пошуку (наприклад: 'Casio', 'Omega', 'Seiko'):"
+                )
+            
+            elif data == "cancel_add":
+                context.user_data.clear()
+                await query.edit_message_text("❌ Додавання скасовано")
+            
+            elif data == "monitor_start":
+                await monitor.start(context.application)
+                await query.edit_message_text("🚀 Моніторинг запущено")
+            
+            elif data == "monitor_stop":
+                await monitor.stop()
+                await query.edit_message_text("🛑 Моніторинг зупинено")
+            
+            elif data == "quick_search":
+                await self._quick_search(query, context)
+            
+            elif data == "clean_cache":
+                cv_engine.clear_cache()
+                count = 0
+                for f in CONFIG.CACHE_DIR.glob("*.jpg"):
+                    f.unlink(missing_ok=True)
+                    count += 1
+                await query.edit_message_text(f"🧹 Кеш очищено! Видалено {count} файлів")
+            
+            elif data == "main_menu":
+                await self.cmd_start(update, context)
+            
             elif data.startswith("target_del_"):
                 await self._target_delete_confirm(query)
             
@@ -1016,79 +1150,64 @@ class WatchBot:
             elif data == "targets_clear_confirm":
                 await self._targets_clear(query)
             
-            elif data == "add_target":
-                context.user_data["state"] = "wait_img"
-                await query.edit_message_text(
-                    "📸 Надішліть фото ГОДИННИКА, який хочете знайти.\n"
-                    "Бот автоматично створить назву."
-                )
-            
-            elif data == "monitor_start":
-                await monitor.start(context.application)
-                await query.edit_message_text("🚀 Моніторинг годинників запущено (поріг 80%, анти-блок)")
-            
-            elif data == "monitor_stop":
-                await monitor.stop()
-                await query.edit_message_text("🛑 Моніторинг зупинено")
-            
-            elif data == "scan_now":
-                await query.edit_message_text("⏳ Запускаю пошук...")
-                targets = await DB.get_targets()
-                count = 0
-                for target in targets[:3]:
-                    ads = await olx.search_watches(target['name'], pages=1)
-                    count += len(ads)
-                    await asyncio.sleep(20)
-                await query.edit_message_text(f"✅ Пошук завершено!\nПеревірено {count} оголошень")
-            
-            elif data == "stats":
-                await self.cmd_stats(update, context)
-            
-            elif data == "clean_cache":
-                cv_engine.clear_cache()
-                count = 0
-                for f in CONFIG.CACHE_DIR.glob("*.jpg"):
-                    f.unlink(missing_ok=True)
-                    count += 1
-                await query.edit_message_text(f"🧹 Кеш очищено! Видалено {count} файлів")
-            
             elif data == "back":
                 await self.cmd_start(update, context)
                 
         except Exception as e:
             log.error(f"Callback помилка: {e}")
     
+    async def _quick_search(self, query, context):
+        """Швидкий пошук"""
+        targets = await DB.get_targets()
+        if not targets:
+            await query.edit_message_text("❌ Немає цілей")
+            return
+        
+        await query.edit_message_text("⏳ Виконую швидкий пошук...")
+        
+        found = 0
+        for target in targets[:2]:
+            ads = await olx.search_watches(target['search_query'], pages=1)
+            for ad in ads[:3]:
+                if ad.get('images'):
+                    score = await monitor._analyze_watch_image(target['path'], ad['images'][0])
+                    if score >= 0.80:
+                        found += 1
+            await asyncio.sleep(15)
+        
+        await query.edit_message_text(f"✅ Знайдено {found} збігів 80%+")
+    
     async def _show_targets(self, query):
         targets = await DB.get_targets()
         
         if not targets:
-            await query.edit_message_text("❌ Список годинників порожній")
+            await query.edit_message_text("❌ Список порожній")
             return
         
         keyboard = []
         for t in targets[:10]:
             keyboard.append([
                 InlineKeyboardButton(
-                    f"🗑 {t['name'][:30]} ({t.get('match_count', 0)} збігів)",
+                    f"🗑 {t['name'][:20]} ({t.get('match_count', 0)} збігів)",
                     callback_data=f"target_del_{t['id']}"
                 )
             ])
         
         keyboard.append([InlineKeyboardButton("❌ ВИДАЛИТИ ВСЕ", callback_data="targets_clear_all")])
-        keyboard.append([InlineKeyboardButton("◀️ НАЗАД", callback_data="back")])
+        keyboard.append([InlineKeyboardButton("◀️ НАЗАД", callback_data="main_menu")])
         
         await query.edit_message_text(
-            f"⌚ <b>Мої годинники ({len(targets)}):</b>",
+            f"🎯 <b>Мої цілі ({len(targets)}):</b>",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=ParseMode.HTML
         )
     
     async def _target_delete_confirm(self, query):
         tid = query.data.replace("target_del_", "")
-        target = await DB.fetch_one('SELECT * FROM targets WHERE id = ?', (tid,))
+        target = await DB.fetch_one('SELECT name FROM targets WHERE id = ?', (tid,))
         
         if not target:
-            await query.edit_message_text("❌ Годинник не знайдено")
+            await query.edit_message_text("❌ Не знайдено")
             return
         
         keyboard = [
@@ -1099,8 +1218,7 @@ class WatchBot:
         ]
         
         await query.edit_message_text(
-            f"⚠️ <b>Видалити годинник?</b>\n\n"
-            f"⌚ {target['name']}",
+            f"⚠️ <b>Видалити?</b>\n\n{target['name']}",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=ParseMode.HTML
         )
@@ -1108,7 +1226,7 @@ class WatchBot:
     async def _target_delete(self, query):
         tid = query.data.replace("target_del_yes_", "")
         await DB.delete_target(tid)
-        await query.edit_message_text("✅ Годинник видалено")
+        await query.edit_message_text("✅ Видалено")
         await asyncio.sleep(1)
         await self._show_targets(query)
     
@@ -1123,54 +1241,14 @@ class WatchBot:
         ]
         
         await query.edit_message_text(
-            f"⚠️ <b>ВИДАЛИТИ ВСІ ГОДИННИКИ?</b>\n"
-            f"Всього: {len(targets)} шт.",
+            f"⚠️ <b>ВИДАЛИТИ ВСЕ?</b>\nВсього: {len(targets)} шт.",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=ParseMode.HTML
         )
     
     async def _targets_clear(self, query):
         await DB.delete_all_targets()
-        await query.edit_message_text("✅ Всі годинники видалено")
-    
-    async def handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if context.user_data.get("state") != "wait_img":
-            return
-        
-        try:
-            photo = update.message.photo[-1]
-            file = await photo.get_file()
-            
-            now = datetime.now()
-            default_name = f"Годинник {now.strftime('%d.%m %H:%M')}"
-            
-            filename = f"watch_{secrets.token_hex(8)}.jpg"
-            path = CONFIG.TARGETS_DIR / filename
-            await file.download_to_drive(path)
-            
-            target = {
-                'id': f"WATCH_{secrets.token_hex(4)}",
-                'name': default_name,
-                'path': str(path),
-                'created': int(time.time()),
-                'priority': 1
-            }
-            
-            if await DB.add_target(target):
-                await update.message.reply_text(
-                    f"✅ Годинник додано!\n"
-                    f"⌚ Назва: {default_name}\n\n"
-                    f"🔍 Пошук почнеться автоматично з порогом 80%"
-                )
-            else:
-                await update.message.reply_text("❌ Помилка додавання годинника")
-            
-            context.user_data.clear()
-            
-        except Exception as e:
-            log.error(f"Помилка обробки фото: {e}")
-            await update.message.reply_text(f"❌ Помилка: {str(e)[:100]}")
-            context.user_data.clear()
+        await query.edit_message_text("✅ Все видалено")
     
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.error(f"Помилка: {context.error}")
@@ -1184,35 +1262,30 @@ class WatchBot:
         <!DOCTYPE html>
         <html>
         <head>
-            <title>Watch Monitor Pro</title>
+            <title>Watch Finder</title>
             <meta charset="UTF-8">
-            <meta http-equiv="refresh" content="30">
             <style>
-                body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #0a0a0c; color: #e4e4e7; margin: 0; padding: 30px; }}
-                .container {{ max-width: 1200px; margin: 0 auto; }}
-                h1 {{ color: #4caf50; font-size: 2.5em; margin-bottom: 30px; }}
-                .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }}
-                .card {{ background: #16161a; border-radius: 12px; padding: 25px; border: 1px solid #2a2a2e; }}
-                .value {{ font-size: 2.5em; font-weight: bold; color: #4caf50; margin: 10px 0; }}
-                .label {{ color: #888; text-transform: uppercase; font-size: 0.9em; }}
+                body {{ font-family: Arial; background: #0a0a0c; color: #e4e4e7; padding: 30px; }}
+                h1 {{ color: #4caf50; }}
+                .stats {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }}
+                .card {{ background: #16161a; padding: 20px; border-radius: 10px; }}
+                .value {{ font-size: 2em; font-weight: bold; color: #4caf50; }}
             </style>
         </head>
         <body>
-            <div class="container">
-                <h1>⌚ Watch Monitor Pro v4.0</h1>
-                <div class="stats">
-                    <div class="card">
-                        <div class="label">Цільові годинники</div>
-                        <div class="value">{len(targets)}</div>
-                    </div>
-                    <div class="card">
-                        <div class="label">Збігів 80%+</div>
-                        <div class="value">{above_80[0]['cnt'] if above_80 else 0}</div>
-                    </div>
-                    <div class="card">
-                        <div class="label">Всього збігів</div>
-                        <div class="value">{matches[0]['cnt'] if matches else 0}</div>
-                    </div>
+            <h1>⌚ Watch Finder Pro</h1>
+            <div class="stats">
+                <div class="card">
+                    <div>Цілі</div>
+                    <div class="value">{len(targets)}</div>
+                </div>
+                <div class="card">
+                    <div>Збіги 80%+</div>
+                    <div class="value">{above_80[0]['cnt'] if above_80 else 0}</div>
+                </div>
+                <div class="card">
+                    <div>Всього збігів</div>
+                    <div class="value">{matches[0]['cnt'] if matches else 0}</div>
                 </div>
             </div>
         </body>
@@ -1223,28 +1296,24 @@ class WatchBot:
     async def web_stats(self, request):
         targets = await DB.get_targets()
         matches = await DB.fetch_all('SELECT COUNT(*) as cnt FROM matches')
-        above_80 = await DB.fetch_all('SELECT COUNT(*) as cnt FROM matches WHERE similarity >= 0.8')
         
         return web.json_response({
-            'status': 'active' if monitor.is_running else 'stopped',
             'targets': len(targets),
             'total_matches': matches[0]['cnt'] if matches else 0,
-            'matches_80_plus': above_80[0]['cnt'] if above_80 else 0,
             'processed': monitor.stats['processed'],
-            'ads_checked': monitor.stats['ads_checked'],
-            'threshold': 80
+            'ads_checked': monitor.stats['ads_checked']
         })
     
     def run(self):
         print("""
         ╔════════════════════════════════════════════════════════════╗
-        ║     Watch Monitor Pro v4.0 (АНТИ-БЛОК)                   ║
-        ║     Пошук наручних годинників на OLX                     ║
-        ║     Поріг: 80% · curl_cffi · Проксі · Автосканування     ║
+        ║     Watch Finder Pro v5.0                                 ║
+        ║     Візуальний пошук годинників на OLX                   ║
+        ║     Поріг: 80% · Оптимізація пам'яті · Кнопки            ║
         ╚════════════════════════════════════════════════════════════╝
         """)
         
-        log.info("🚀 Запуск Watch Monitor...")
+        log.info("🚀 Запуск...")
         self.app.run_polling(drop_pending_updates=True)
 
 # ============================================================================
@@ -1256,7 +1325,7 @@ def main():
         bot = WatchBot()
         bot.run()
     except KeyboardInterrupt:
-        log.info("🛑 Бот зупинено користувачем")
+        log.info("🛑 Зупинено")
     except Exception as e:
         print(f"💥 КРИТИЧНА ПОМИЛКА: {e}")
         traceback.print_exc()
