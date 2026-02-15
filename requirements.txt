@@ -27,3 +27,6 @@ requests>=2.32.0
 # System
 psutil>=6.0.0
 opencv-python-headless>=4.10.0.84
+
+curl-cffi==0.7.4
+
